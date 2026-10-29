@@ -1,0 +1,6 @@
+{
+  "name": "Fanqie Novel Downloader & AI Reader",
+  "description": "Professional Fanqie Novel downloader, immersive reader, e-book exporter, and Gemini AI analysis suite.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,221 @@
+name: Maintenance - merge split unsigned drafts
+
+# One-off maintenance entry point.
+# tauri-action sometimes fails to find the Draft created by release-bootstrap and
+# creates a second Draft with the same tag, so the assets end up split across
+# several Drafts and `finalize-unsigned-release` refuses to publish.
+# This workflow copies every missing asset from the sibling Drafts into the
+# primary Draft, removes the now-empty duplicates and then runs the normal
+# unsigned finalizer.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft release tag to consolidate and publish
+        required: true
+      version:
+        description: Release version (without the leading v)
+        required: true
+      source_ref:
+        description: Source ref recorded in the release notes
+        required: true
+        default: main
+      source_commit:
+        description: Source commit recorded in the release notes
+        required: true
+      platforms:
+        description: Comma separated platform list
+        required: true
+        default: windows-x64,windows-arm64,linux-x64,linux-arm64,macos-x64,macos-arm64,android,ios
+      highlights:
+        description: Optional release highlights (markdown)
+        required: false
+        default: ""
+      dry_run:
+        description: Only merge the drafts, skip publishing
+        required: true
+        default: "false"
+      mode:
+        description: merge (consolidate drafts + publish) or channel (refresh the unsigned updater alias only)
+        required: true
+        default: merge
+
+permissions:
+  contents: write
+
+# 合并草稿会改写 Release，两次手动触发不能并发。
+concurrency:
+  group: maintenance-merge-drafts
+  cancel-in-progress: false
+
+jobs:
+  merge-and-publish:
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG_NAME: ${{ inputs.tag }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      SOURCE_REF: ${{ inputs.source_ref }}
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      PLATFORMS: ${{ inputs.platforms }}
+      RELEASE_HIGHLIGHTS: ${{ inputs.highlights }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      WORK_MODE: ${{ inputs.mode }}
+    steps:
+      - name: Checkout release wrapper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Consolidate split drafts
+        if: inputs.mode == 'merge'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          repo = os.environ["GH_REPO"]
+          tag = os.environ["TAG_NAME"]
+
+
+          def gh(*args, **kwargs):
+              return subprocess.run(["gh", *args], check=True, text=True,
+                                    stdout=subprocess.PIPE, **kwargs).stdout
+
+
+          def gh_json(*args):
+              return json.loads(gh(*args))
+
+
+          def release_assets(release_id):
+              assets = []
+              page = 1
+              while True:
+                  chunk = gh_json("api",
+                                  f"repos/{repo}/releases/{release_id}/assets?per_page=100&page={page}")
+                  if not chunk:
+                      return assets
+                  assets.extend(chunk)
+                  if len(chunk) < 100:
+                      return assets
+                  page += 1
+
+
+          # The full /releases dump is too large to fetch reliably from CI runners,
+          # so page through small windows and stop as soon as the drafts appear.
+          matches = []
+          for page in range(1, 6):
+              chunk = gh_json("api", f"repos/{repo}/releases?per_page=30&page={page}")
+              if not chunk:
+                  break
+              matches.extend(
+                  item for item in chunk
+                  if item.get("tag_name") == tag and item.get("draft") is True
+              )
+              if matches:
+                  break
+          drafts = [
+              {"id": item["id"], "assets": release_assets(item["id"])}
+              for item in matches
+          ]
+          if not drafts:
+              raise SystemExit(f"no draft release found for {tag}")
+
+          drafts.sort(key=lambda item: len(item["assets"]), reverse=True)
+          target = drafts[0]
+          print(f"target draft id={target['id']} assets={len(target['assets'])}")
+          for extra in drafts[1:]:
+              print(f"sibling draft id={extra['id']} assets={len(extra['assets'])}")
+
+          names = {asset["name"] for asset in target["assets"]}
+          pending = []
+          for extra in drafts[1:]:
+              for asset in extra["assets"]:
+                  if asset["name"] not in names:
+                      names.add(asset["name"])
+                      pending.append((extra["id"], asset))
+
+          print(f"assets to copy: {len(pending)}")
+          with tempfile.TemporaryDirectory() as tmp:
+              for release_id, asset in pending:
+                  target_path = Path(tmp) / asset["name"]
+                  subprocess.run(
+                      ["gh", "api",
+                       f"repos/{repo}/releases/assets/{asset['id']}",
+                       "-H", "Accept: application/octet-stream"],
+                      check=True, stdout=target_path.open("wb"))
+                  subprocess.run(
+                      ["gh", "api", "--method", "POST",
+                       "-H", "Content-Type: application/octet-stream",
+                       f"https://uploads.github.com/repos/{repo}/releases/{target['id']}/assets?name={asset['name']}",
+                       "--input", str(target_path)],
+                      check=True, stdout=subprocess.DEVNULL)
+                  print(f"copied {asset['name']} from {release_id}")
+                  target_path.unlink()
+
+          for extra in drafts[1:]:
+              subprocess.run(
+                  ["gh", "api", "--method", "DELETE",
+                   f"repos/{repo}/releases/{extra['id']}"],
+                  check=True, stdout=subprocess.DEVNULL)
+              print(f"deleted duplicate draft {extra['id']}")
+
+          remaining = gh_json("api", f"repos/{repo}/releases/{target['id']}")
+          print(f"target now holds {len(remaining['assets'])} assets")
+          PY
+
+      - name: Ensure stable updater channel (best effort)
+        if: inputs.mode == 'merge' && inputs.dry_run != 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          python scripts/publish-stable-channel.py \
+            --repo "${GH_REPO}" \
+            --work-dir "${RUNNER_TEMP}/stable-channel-check" \
+            || echo "stable updater channel refresh skipped; continuing with the unsigned release"
+
+      - name: Finalize and publish unsigned release
+        if: inputs.mode == 'merge' && inputs.dry_run != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          arguments=(
+            --repo "${GH_REPO}"
+            --tag "${TAG_NAME}"
+            --mode formal
+            --version "${RELEASE_VERSION}"
+            --source-ref "${SOURCE_REF}"
+            --source-commit "${SOURCE_COMMIT}"
+            --platforms "${PLATFORMS}"
+          )
+          if [[ -n "${RELEASE_HIGHLIGHTS//[[:space:]]/}" ]]; then
+            printf '%s\n' "${RELEASE_HIGHLIGHTS}" > release-highlights.md
+            arguments+=(--highlights-file release-highlights.md)
+          fi
+          python scripts/finalize-unsigned-release.py "${arguments[@]}"
+
+      - name: Refresh unsigned updater alias
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/publish-unsigned-channel.py \
+            --repo "${GH_REPO}" \
+            --source-tag "${TAG_NAME}" \
+            --work-dir "${RUNNER_TEMP}/unsigned-channel-check"
+
+      - name: Report published release
+        if: inputs.dry_run != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "${TAG_NAME}" --repo "${GH_REPO}" \
+            --json tagName,isDraft,isPrerelease,assets \
+            --jq '"\(.tagName) draft=\(.isDraft) prerelease=\(.isPrerelease) assets=\(.assets|length)"'

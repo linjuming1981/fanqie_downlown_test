@@ -1,0 +1,67 @@
+name: 使用求助
+description: 咨询安装、配置或使用方法，排查尚未确认的故障
+title: "[Help] "
+labels: ["求助"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        这里适合提交安装、配置和使用问题。能够稳定复现的软件故障请改用“错误反馈”。
+
+        请勿提交 token、签名、私钥、设备标识、Cookie 或其他个人数据。
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已看过 README 的下载安装和常见问题，并搜索过现有 Issue。
+          required: true
+        - label: 我已删除日志、截图和链接中的敏感信息。
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: 应用版本
+      description: 请填写完整版本号；尚未安装时填写“未安装”。
+      placeholder: 例如 2026.10.23-557
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 运行平台
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Android
+        - iOS
+        - 其他
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 系统版本与架构
+      placeholder: 例如 macOS 15 arm64；Ubuntu 24.04 x64
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: 具体问题
+      description: 说明你想完成什么、卡在哪一步，以及当前看到的结果。
+    validations:
+      required: true
+  - type: textarea
+    id: attempts
+    attributes:
+      label: 已尝试的方法
+      description: 列出已经查看的文档、尝试过的操作及其结果，避免重复排查。
+    validations:
+      required: true
+  - type: textarea
+    id: additional
+    attributes:
+      label: 脱敏日志或截图
+      description: 可附完整的报错文字和截图；请先删掉账号、Cookie、token 等个人信息。

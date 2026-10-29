@@ -1,0 +1,3282 @@
+name: 发布 / 全平台构建
+
+# 公开仓库只负责调度、打包和发布；核心源码在运行时从私有 Tauri
+# 仓库只读检出，不会提交到本仓库。
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "私有 Tauri 源码分支 / Tag / Commit"
+        required: true
+        default: "main"
+        type: string
+      publish_release:
+        description: "创建 GitHub Release"
+        required: true
+        default: true
+        type: boolean
+      publish_unsigned_prerelease:
+        description: "无正式签名密钥时发布独立未签名测试预发布；请将 publish_release 设为 false"
+        required: true
+        default: false
+        type: boolean
+      publish_unsigned_release:
+        description: "发布无厂商/系统签名正式 Release（仍生成加密校验的 updater；请同时将 publish_release 设为 true）"
+        required: true
+        default: false
+        type: boolean
+      prerelease:
+        description: "标记为预发布（预发布不会被稳定版自动更新检测到）"
+        required: true
+        default: false
+        type: boolean
+      platforms:
+        description: "逗号分隔的平台：windows-x64,windows-arm64,linux-x64,linux-arm64,macos-x64,macos-arm64,android,ios"
+        required: true
+        default: "windows-x64,windows-arm64,linux-x64,linux-arm64,macos-x64,macos-arm64,android,ios"
+        type: string
+      macos_unsigned_channel:
+        description: "独立的 macOS 未签名通道：ad-hoc 签名 + DMG 启动 smoke test，发布 macos-unsigned-v* 独立预发布（不需要 updater 密钥；其余 publish_* 必须为 false）"
+        required: false
+        default: false
+        type: boolean
+      release_highlights:
+        description: "可选的发布要点，每行一项"
+        required: false
+        default: ""
+        type: string
+
+# 默认只读；需要创建/编辑 Release 的 job 各自声明 contents: write。
+# verify 在公开 runner 上执行私有源码的构建脚本与测试，不需要也不应拿到写权限。
+permissions:
+  contents: read
+
+# 不取消进行中的运行：finalize 正在上传资产 / 发布时被新一次 dispatch 取消，会留下
+# 半发布的 Release（latest.json 与资产不一致）。新的 dispatch 排队等待即可。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  PRIVATE_SOURCE_REPOSITORY: "POf-L/Fanqie-novel-Downloader-tauri"
+  PRIVATE_SOURCE_PATH: "private-src"
+  TAURI_CLI_VERSION: "2.12.4"
+  ANDROID_API_LEVEL: "36"
+  ANDROID_BUILD_TOOLS: "36.0.0"
+  ANDROID_NDK_VERSION: "27.2.12479018"
+  # 正式 Android 发布证书的 SHA-256 指纹（公开信息，不是密钥）。用正式 keystore
+  # 签出的每个 APK 都必须是这张证书：Secrets 被换成别的 keystore 时在这里失败，
+  # 而不是发出一版用户无法覆盖升级的安装包。取值核对自已发布的
+  # 2026.9.14-944、2026.10.23-2316、2026.10.24-1638 APK（v2/v3 签名块一致）。
+  # 有意更换签名证书时，先在这里更新指纹并在发布说明中告知需要卸载重装。
+  ANDROID_RELEASE_SIGNER_SHA256: "995daeb9b65c87b259f574ec51ea2212efd1eae7fe69558372edc72ba26121ad"
+
+jobs:
+  prepare:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      desktop_matrix: ${{ steps.platforms.outputs.desktop_matrix }}
+      macos_unsigned_matrix: ${{ steps.platforms.outputs.macos_unsigned_matrix }}
+      desktop_fallback_matrix: ${{ steps.platforms.outputs.desktop_fallback_matrix }}
+      desktop_count: ${{ steps.platforms.outputs.desktop_count }}
+      desktop_fallback_count: ${{ steps.platforms.outputs.desktop_fallback_count }}
+      android_enabled: ${{ steps.platforms.outputs.android_enabled }}
+      ios_enabled: ${{ steps.platforms.outputs.ios_enabled }}
+      selected_platforms: ${{ steps.platforms.outputs.selected_platforms }}
+      source_commit: ${{ steps.meta.outputs.source_commit }}
+      source_commit_full: ${{ steps.meta.outputs.source_commit_full }}
+      source_ref: ${{ steps.meta.outputs.source_ref }}
+      version: ${{ steps.meta.outputs.version }}
+      tag_name: ${{ steps.meta.outputs.tag_name }}
+      updater_signing: ${{ steps.secrets.outputs.updater_signing }}
+      create_updater_artifacts: ${{ steps.secrets.outputs.create_updater_artifacts }}
+      android_signing: ${{ steps.secrets.outputs.android_signing }}
+      ios_signing: ${{ steps.secrets.outputs.ios_signing }}
+      macos_signing: ${{ steps.secrets.outputs.macos_signing }}
+      unsigned_mode: ${{ steps.secrets.outputs.unsigned_mode }}
+      update_channel: ${{ steps.secrets.outputs.update_channel }}
+      third_party_licenses: ${{ steps.licenses.outputs.available }}
+    steps:
+      - name: Validate private source token
+        env:
+          PRIVATE_SOURCE_TOKEN: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+        run: |
+          if [[ -z "${PRIVATE_SOURCE_TOKEN}" ]]; then
+            echo "Missing repository secret: PRIVATE_SOURCE_TOKEN"
+            exit 1
+          fi
+
+      - name: Checkout private Tauri source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ env.PRIVATE_SOURCE_REPOSITORY }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+          persist-credentials: false
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+
+      - name: Clean up stale draft releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          drafts=$(gh release list --repo "${GH_REPO}" --limit 200 --json tagName,isDraft \
+            --jq '.[] | select(.isDraft) | .tagName')
+          if [[ -z "$(printf '%s' "${drafts}" | tr -d '[:space:]')" ]]; then
+            echo "没有需要清理的 draft release"
+            exit 0
+          fi
+          while IFS= read -r tag; do
+            [[ -z "${tag}" ]] && continue
+            echo "清理残留 draft release: ${tag}"
+            gh release delete "${tag}" --repo "${GH_REPO}" --yes --cleanup-tag || true
+          done <<< "${drafts}"
+          echo "draft release 清理完成"
+
+      # 第三方许可证清单只生成一次：既是门禁（用私有仓库 about.toml 的白名单跑 cargo-about，
+      # 出现白名单外或无法识别的许可证直接失败，只打印通过/失败，不打印 cargo-about 的输出），
+      # 也作为 artifact 交给各构建 job 打进安装包，并由 release-bootstrap 作为 Release 资产上传。
+      # 这个 artifact 只有生成的 HTML 一个文件，内容本来就要公开发布。
+      - uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
+
+      - name: Generate third-party license list (silent)
+        id: licenses
+        shell: bash
+        env:
+          CARGO_ABOUT_VERSION: "0.9.2"
+          CARGO_ABOUT_SHA256: "9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af"
+        run: |
+          set -uo pipefail
+          generator="${PRIVATE_SOURCE_PATH}/scripts/generate-third-party-licenses.sh"
+          if [[ ! -f "${generator}" ]]; then
+            echo "::warning::私有源码没有 scripts/generate-third-party-licenses.sh，跳过许可证检查和随包分发。"
+            echo "available=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          out="${RUNNER_TEMP}/third-party-licenses"
+          mkdir -p "${out}"
+          work="$(mktemp -d "${RUNNER_TEMP}/cargo-about.XXXXXX")"
+          trap 'rm -rf "${work}"' EXIT
+          archive="cargo-about-${CARGO_ABOUT_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL --retry 3 -o "${work}/${archive}" \
+            "https://github.com/EmbarkStudios/cargo-about/releases/download/${CARGO_ABOUT_VERSION}/${archive}"
+          echo "${CARGO_ABOUT_SHA256}  ${work}/${archive}" | sha256sum --check --quiet || exit 1
+          tar -xzf "${work}/${archive}" -C "${work}" --strip-components=1
+          if PATH="${work}:${PATH}" bash "${generator}" "${out}/THIRD_PARTY_LICENSES.html" \
+            >"${work}/log" 2>&1 </dev/null; then
+            echo "通过  third-party-licenses"
+          else
+            echo "::error::第三方许可证检查未通过（出现白名单外或无法识别的许可证）。公开日志不包含输出，请在私有仓库本地运行 scripts/generate-third-party-licenses.sh 查看。"
+            exit 1
+          fi
+          if [[ ! -s "${out}/THIRD_PARTY_LICENSES.html" ]] \
+            || grep -q "fanqie-third-party-licenses-placeholder" "${out}/THIRD_PARTY_LICENSES.html"; then
+            echo "::error::生成的第三方许可证清单为空或仍是占位文件。"
+            exit 1
+          fi
+          echo "available=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload third-party license list
+        if: steps.licenses.outputs.available == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: third-party-licenses
+          path: ${{ runner.temp }}/third-party-licenses/THIRD_PARTY_LICENSES.html
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Select build platforms
+        id: platforms
+        shell: python
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          import json
+          import os
+
+          # allow_fallback: scarce runners may OOM / queue-fail; a second job
+          # cross-compiles on a more available runner when release assets are missing.
+          candidates = [
+              ("WINDOWS_X64", {
+                  "os": "windows-latest",
+                  "platform": "windows-x64",
+                  "target": "x86_64-pc-windows-msvc",
+                  "bundles": "nsis",
+                  "allow_fallback": False,
+                  "asset_substr": "windows-x64",
+              }),
+              ("WINDOWS_ARM64", {
+                  "os": "windows-11-arm",
+                  "platform": "windows-arm64",
+                  "target": "aarch64-pc-windows-msvc",
+                  "bundles": "nsis",
+                  "allow_fallback": True,
+                  "fallback_os": "windows-latest",
+                  "fallback_bundles": "nsis",
+                  "asset_substr": "windows-arm64",
+              }),
+              ("LINUX_X64", {
+                  "os": "ubuntu-24.04",
+                  "platform": "linux-x64",
+                  "target": "x86_64-unknown-linux-gnu",
+                  "bundles": "deb,appimage",
+                  "allow_fallback": False,
+                  "asset_substr": "linux-amd64",
+              }),
+              ("LINUX_ARM64", {
+                  "os": "ubuntu-24.04-arm",
+                  "platform": "linux-arm64",
+                  "target": "aarch64-unknown-linux-gnu",
+                  "bundles": "deb,appimage",
+                  # Cross AppImage is impractical; fallback only builds .deb.
+                  "allow_fallback": True,
+                  "fallback_os": "ubuntu-22.04",
+                  "fallback_bundles": "deb",
+                  "asset_substr": "linux-arm64",
+              }),
+              ("MACOS_X64", {
+                  "os": "macos-15-intel",
+                  "platform": "macos-x64",
+                  "target": "x86_64-apple-darwin",
+                  "bundles": "app,dmg",
+                  "allow_fallback": True,
+                  "fallback_os": "macos-latest",
+                  "fallback_bundles": "app,dmg",
+                  "asset_substr": "darwin-x64",
+              }),
+              ("MACOS_ARM64", {
+                  "os": "macos-latest",
+                  "platform": "macos-arm64",
+                  "target": "aarch64-apple-darwin",
+                  "bundles": "app,dmg",
+                  "allow_fallback": False,
+                  "asset_substr": "darwin-aarch64",
+              }),
+          ]
+          def normalize(name: str) -> str:
+              return name.strip().lower().replace("_", "-")
+
+          requested = {
+              normalize(name)
+              for name in os.environ.get("PLATFORMS", "").split(",")
+              if name.strip()
+          }
+          known = {normalize(name) for name, _ in candidates} | {"android", "ios"}
+          unknown = sorted(requested - known)
+          if unknown:
+              raise SystemExit(
+                  "未知平台: " + ", ".join(unknown) +
+                  "; 可选值: " + ", ".join(sorted(known))
+              )
+
+          desktop = [
+              entry for name, entry in candidates if normalize(name) in requested
+          ]
+          fallback = [
+              {
+                  "os": entry["fallback_os"],
+                  "platform": entry["platform"],
+                  "target": entry["target"],
+                  "bundles": entry["fallback_bundles"],
+                  "asset_substr": entry["asset_substr"],
+                  "native_os": entry["os"],
+              }
+              for entry in desktop
+              if entry.get("allow_fallback")
+          ]
+          android = "android" in requested
+          ios = "ios" in requested
+          selected = [entry["platform"] for entry in desktop]
+          if android:
+              selected.append("android")
+          if ios:
+              selected.append("ios")
+          if not selected:
+              raise SystemExit("请至少选择一个目标平台")
+
+          outputs = {
+              "desktop_matrix": json.dumps(
+                  {"include": desktop}, separators=(",", ":")
+              ),
+              # 独立 macOS 未签名通道固定构建两种架构，与原 publish-unsigned-macos
+              # 工作流保持一致，不受 platforms 影响。
+              "macos_unsigned_matrix": json.dumps(
+                  {
+                      "include": [
+                          {
+                              "os": "macos-15-intel",
+                              "arch": "x64",
+                              "macho_arch": "x86_64",
+                              "target": "x86_64-apple-darwin",
+                          },
+                          {
+                              "os": "macos-latest",
+                              "arch": "arm64",
+                              "macho_arch": "arm64",
+                              "target": "aarch64-apple-darwin",
+                          },
+                      ]
+                  },
+                  separators=(",", ":"),
+              ),
+              "desktop_fallback_matrix": json.dumps(
+                  {"include": fallback}, separators=(",", ":")
+              ),
+              "desktop_count": str(len(desktop)),
+              "desktop_fallback_count": str(len(fallback)),
+              "android_enabled": str(android).lower(),
+              "ios_enabled": str(ios).lower(),
+              "selected_platforms": ", ".join(selected),
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for key, value in outputs.items():
+                  output.write(f"{key}={value}\n")
+
+      - name: Generate release metadata
+        id: meta
+        shell: python
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          PUBLISH_UNSIGNED_PRERELEASE: ${{ inputs.publish_unsigned_prerelease }}
+          PUBLISH_UNSIGNED_RELEASE: ${{ inputs.publish_unsigned_release }}
+          MACOS_UNSIGNED_CHANNEL: ${{ inputs.macos_unsigned_channel }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          import os
+          import subprocess
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          source = Path(os.environ["PRIVATE_SOURCE_PATH"])
+          source_commit = subprocess.check_output(
+              ["git", "-C", str(source), "rev-parse", "--short=12", "HEAD"],
+              text=True,
+          ).strip()
+          source_commit_full = subprocess.check_output(
+              ["git", "-C", str(source), "rev-parse", "HEAD"],
+              text=True,
+          ).strip()
+          now = datetime.now(timezone.utc)
+          # Tauri 强制 SemVer（最多 3 段、禁止前导零），所以用
+          #   YYYY.M.D-HM  → 如 2025.7.7-837
+          # 3 段保证 SemVer 合法，-HM 作为 pre-release 后缀保留时间精度。
+          # version_parts() 逐段提取数字，解析为 [2025, 7, 7, 837]，
+          # 与老版 Go 的 [2025, 6, 7, 27] 比较逻辑完全一致。
+          # 不用 strftime("%-m") 因为该格式化符在 Windows 上不支持。
+          hm = now.hour * 100 + now.minute
+          version = f"{now.year}.{now.month}.{now.day}-{hm}"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"source_commit={source_commit}\n")
+              output.write(f"source_commit_full={source_commit_full}\n")
+              output.write(f"source_ref={os.environ['SOURCE_REF']}\n")
+              output.write(f"version={version}\n")
+              if os.environ["MACOS_UNSIGNED_CHANNEL"] == "true":
+                  # 独立 macOS 未签名通道保持自己的 tag 命名，不进入 v* / unsigned-v* 序列。
+                  tag_name = f"macos-unsigned-v{version}-r{os.environ['RUN_NUMBER']}"
+              elif os.environ["PUBLISH_UNSIGNED_PRERELEASE"] == "true" or os.environ["PUBLISH_UNSIGNED_RELEASE"] == "true":
+                  tag_name = f"unsigned-v{version}-r{os.environ['RUN_NUMBER']}"
+              else:
+                  tag_name = f"v{version}"
+              output.write(f"tag_name={tag_name}\n")
+
+      - name: Validate optional signing secrets
+        id: secrets
+        shell: bash
+        env:
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
+          PUBLISH_UNSIGNED_PRERELEASE: ${{ inputs.publish_unsigned_prerelease }}
+          PUBLISH_UNSIGNED_RELEASE: ${{ inputs.publish_unsigned_release }}
+          MACOS_UNSIGNED_CHANNEL: ${{ inputs.macos_unsigned_channel }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          ANDROID_ENABLED: ${{ steps.platforms.outputs.android_enabled }}
+          IOS_ENABLED: ${{ steps.platforms.outputs.ios_enabled }}
+          MACOS_ENABLED: ${{ contains(steps.platforms.outputs.selected_platforms, 'macos-') }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
+          APPLE_DEVELOPMENT_TEAM: ${{ secrets.APPLE_DEVELOPMENT_TEAM }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [[ "${MACOS_UNSIGNED_CHANNEL}" == "true" ]]; then
+            # 独立 macOS 未签名通道自带 Draft/发布收尾，不复用签名或 unsigned-v* 流程，
+            # 也不需要 updater 密钥。
+            for name in PUBLISH_RELEASE PUBLISH_UNSIGNED_PRERELEASE PUBLISH_UNSIGNED_RELEASE PRERELEASE; do
+              if [[ "${!name}" == "true" ]]; then
+                echo "macos_unsigned_channel is a standalone channel; set ${name}=false."
+                exit 1
+              fi
+            done
+          fi
+          if [[ "${PUBLISH_UNSIGNED_PRERELEASE}" == "true" &&
+                "${PUBLISH_UNSIGNED_RELEASE}" == "true" ]]; then
+            echo "publish_unsigned_prerelease and publish_unsigned_release are mutually exclusive."
+            exit 1
+          fi
+          if [[ "${PUBLISH_RELEASE}" == "true" &&
+                "${PUBLISH_UNSIGNED_PRERELEASE}" == "true" ]]; then
+            echo "publish_release and publish_unsigned_prerelease are mutually exclusive."
+            exit 1
+          fi
+          if [[ "${PUBLISH_UNSIGNED_RELEASE}" == "true" &&
+                "${PUBLISH_RELEASE}" != "true" ]]; then
+            echo "publish_unsigned_release requires publish_release=true."
+            exit 1
+          fi
+          if [[ "${PUBLISH_UNSIGNED_RELEASE}" == "true" &&
+                "${PRERELEASE}" == "true" ]]; then
+            echo "publish_unsigned_release is a normal (non-prerelease) Release; set prerelease=false."
+            exit 1
+          fi
+
+          updater=false
+          android=false
+          ios=false
+          if [[ -n "${TAURI_SIGNING_PRIVATE_KEY}" &&
+                -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}" ]]; then
+            updater=true
+          fi
+          if [[ -n "${ANDROID_KEYSTORE_BASE64}" &&
+                -n "${ANDROID_KEY_ALIAS}" &&
+                -n "${ANDROID_KEYSTORE_PASSWORD}" &&
+                -n "${ANDROID_KEY_PASSWORD}" ]]; then
+            android=true
+          fi
+          if [[ -n "${IOS_CERTIFICATE}" &&
+                -n "${IOS_CERTIFICATE_PASSWORD}" &&
+                -n "${IOS_MOBILE_PROVISION}" &&
+                -n "${APPLE_DEVELOPMENT_TEAM}" ]]; then
+            ios=true
+          fi
+          macos=false
+          if [[ -n "${APPLE_CERTIFICATE}" &&
+                -n "${APPLE_CERTIFICATE_PASSWORD}" &&
+                -n "${APPLE_SIGNING_IDENTITY}" &&
+                -n "${APPLE_ID}" &&
+                -n "${APPLE_PASSWORD}" &&
+                -n "${APPLE_TEAM_ID}" ]]; then
+            macos=true
+          fi
+
+          unsigned_mode=false
+          if [[ "${PUBLISH_UNSIGNED_PRERELEASE}" == "true" ||
+                "${PUBLISH_UNSIGNED_RELEASE}" == "true" ]]; then
+            unsigned_mode=true
+          fi
+          create_updater_artifacts="${updater}"
+          # 正式版也必须带 updater 签名：缺了就不会生成 latest.json / .sig，已安装的客户端
+          # 会静默收不到这次更新。tauri.conf.json 里 createUpdaterArtifacts 默认 false
+          # （本地构建没有私钥），发布构建由 tauri.release.conf.json 按这里的结果覆盖。
+          if [[ "${PUBLISH_RELEASE}" == "true" && "${updater}" != "true" ]]; then
+            echo "::error::Publishing a release requires TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD so the in-app updater keeps working."
+            exit 1
+          fi
+          update_channel=stable
+          if [[ "${unsigned_mode}" == "true" ]]; then
+            update_channel=unsigned
+            if [[ "${updater}" != "true" ]]; then
+              echo "Unsigned releases require TAURI_SIGNING_PRIVATE_KEY so updates remain cryptographically verified."
+              exit 1
+            fi
+          fi
+
+          {
+            echo "updater_signing=${updater}"
+            echo "create_updater_artifacts=${create_updater_artifacts}"
+            echo "android_signing=${android}"
+            echo "ios_signing=${ios}"
+            echo "macos_signing=${macos}"
+            echo "unsigned_mode=${unsigned_mode}"
+            echo "update_channel=${update_channel}"
+          } >> "${GITHUB_OUTPUT}"
+
+          # Signing is opportunistic.  Every selected platform must still produce
+          # a user-downloadable artifact when optional signing credentials are
+          # absent; the release notes and signing marker files explain the mode.
+          if [[ "${PUBLISH_RELEASE}" == "true" && "${unsigned_mode}" != "true" ]]; then
+            [[ "${updater}" == "true" ]] || echo "Updater signing secrets missing; publishing desktop packages without updater metadata."
+            if [[ "${ANDROID_ENABLED}" == "true" && "${android}" != "true" ]]; then
+              echo "Android release keystore missing; using an ephemeral CI signing key."
+            fi
+            if [[ "${MACOS_ENABLED}" == "true" && "${macos}" != "true" ]]; then
+              echo "Apple signing/notarization secrets missing; publishing unsigned macOS DMG and APP ZIP."
+            fi
+            if [[ "${IOS_ENABLED}" == "true" && "${ios}" != "true" ]]; then
+              echo "Apple iOS signing secrets missing; publishing an unsigned IPA for sideloading."
+            fi
+          fi
+
+  verify:
+    # 静默 verify：私有源码的 fmt / clippy / test / node 检查仍在公开 runner 上跑
+    # （不占私有仓库的 Actions 额度），但所有输出（含依赖编译、apt 安装）只写进
+    # runner 本地临时文件，不打印、不上传。日志里只有每项通过/失败、退出码、用时；
+    # 失败时到私有仓库本地运行 scripts/verify-local.sh <检查名> 看完整输出。
+    # finalize / finalize-unsigned-release / desktop-fallback 仍要求本 job 成功。
+    needs: prepare
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    outputs:
+      # 形如 "verify 9/9 通过"；finalize 把它和私有源码短提交号写进发布说明。
+      summary: ${{ steps.silent_verify.outputs.summary }}
+    steps:
+      - name: Checkout release wrapper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: release-wrapper
+          persist-credentials: false
+
+      - name: Test release metadata tooling
+        working-directory: release-wrapper
+        run: python -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Checkout private Tauri source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ env.PRIVATE_SOURCE_REPOSITORY }}
+          ref: ${{ needs.prepare.outputs.source_ref }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+          persist-credentials: false
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
+        with:
+          components: rustfmt,clippy
+
+      - name: Install Tauri Linux dependencies (silent)
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$(mktemp "${RUNNER_TEMP}/apt.XXXXXX")"
+          start=${SECONDS}
+          if { sudo apt-get update && sudo apt-get install -y \
+                libwebkit2gtk-4.1-dev \
+                libappindicator3-dev \
+                librsvg2-dev \
+                patchelf \
+                xdg-utils; } </dev/null >"${log}" 2>&1; then
+            echo "通过  apt-install     用时 $((SECONDS - start))s"
+            rm -f "${log}"
+          else
+            code=$?
+            rm -f "${log}"
+            echo "::error::Linux 依赖安装失败（退出码 ${code}），输出未打印。"
+            exit 1
+          fi
+
+      - name: Test and lint Tauri source (silent)
+        id: silent_verify
+        shell: bash
+        run: bash release-wrapper/scripts/silent-verify.sh "${PRIVATE_SOURCE_PATH}"
+
+  release-bootstrap:
+    needs: prepare
+    if: inputs.macos_unsigned_channel != true
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      # 后续所有上传步骤都只按这个 ID 上传，不再按 tag 找草稿。
+      release_id: ${{ steps.release-id.outputs.release_id }}
+    steps:
+      - name: Checkout release wrapper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Create draft release
+        if: >-
+          inputs.publish_release == true ||
+          inputs.publish_unsigned_prerelease == true ||
+          inputs.publish_unsigned_release == true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_REF: ${{ needs.prepare.outputs.source_ref }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          PLATFORMS: ${{ needs.prepare.outputs.selected_platforms }}
+          PRERELEASE: ${{ inputs.publish_unsigned_prerelease || inputs.prerelease }}
+          PUBLISH_UNSIGNED_PRERELEASE: ${{ inputs.publish_unsigned_prerelease }}
+          PUBLISH_UNSIGNED_RELEASE: ${{ inputs.publish_unsigned_release }}
+        run: |
+          set -euo pipefail
+          # Unsigned Drafts expose only a managed build-status block; their real
+          # device links are appended after asset validation. Signed Drafts keep
+          # the existing published-release fallback for compatibility.
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import urllib.request
+          from pathlib import Path
+
+          token = os.environ["GH_TOKEN"]
+          repo = os.environ["GH_REPO"]
+          version = os.environ["VERSION"]
+          tag = os.environ["TAG_NAME"]
+          prerelease = os.environ.get("PRERELEASE", "false").lower() == "true"
+          unsigned_prerelease = (
+              os.environ.get("PUBLISH_UNSIGNED_PRERELEASE", "false").lower()
+              == "true"
+          )
+          unsigned_release = (
+              os.environ.get("PUBLISH_UNSIGNED_RELEASE", "false").lower()
+              == "true"
+          )
+          unsigned = unsigned_prerelease or unsigned_release
+          source_ref = os.environ.get("SOURCE_REF", "")
+          source_commit = os.environ.get("SOURCE_COMMIT", "")
+          platforms = os.environ.get("PLATFORMS", "")
+
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/releases?per_page=30",
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "fanqie-release-bootstrap",
+              },
+          )
+          with urllib.request.urlopen(req) as resp:
+              releases = json.load(resp)
+
+          latest = None
+          for rel in releases:
+              tag_name = str(rel.get("tag_name") or "")
+              if (
+                  rel.get("draft")
+                  or rel.get("prerelease")
+                  or not tag_name.startswith("v")
+                  or tag_name.startswith("unsigned-")
+              ):
+                  continue
+              assets = [a.get("name", "") for a in (rel.get("assets") or [])]
+              if "latest.json" not in assets or not any(
+                  n.lower().endswith(".sig") for n in assets
+              ):
+                  continue
+              useful = [
+                  n for n in assets
+                  if n and not n.endswith(".sig")
+                  and n not in {
+                      "latest.json", "SHA256SUMS-release.txt",
+                      "SHA256SUMS-android.txt", "SHA256SUMS-ios.txt", "SIGNING.txt",
+                      "THIRD_PARTY_LICENSES.html",
+                  }
+              ]
+              if useful:
+                  latest = rel
+                  break
+
+          def pick(names, *needles):
+              out = []
+              for name in names:
+                  low = name.lower()
+                  if all(n.lower() in low for n in needles):
+                      out.append(name)
+              return out
+
+          def link(base, name, label):
+              return f"[{label}]({base}/{name})"
+
+          if unsigned_release:
+              release_label = "（未签名版）"
+          elif unsigned_prerelease:
+              release_label = "（未签名测试预发布）"
+          elif prerelease:
+              release_label = "（测试预发布）"
+          else:
+              release_label = ""
+          lines = [
+              f"## {version}{release_label}",
+              "",
+              "番茄小说下载器：小说、漫画、短剧的下载与阅读工具。",
+              "",
+          ]
+          if unsigned:
+              channel_notice = (
+                  "这是 GitHub Latest 中供手动下载的普通 Release，同时会把由项目 updater 密钥签名的元数据发布到 `unsigned/latest.json`。"
+                  if unsigned_release
+                  else
+                  "这是独立的 GitHub prerelease，不会替代稳定版；无签名客户端通过独立的 `unsigned/latest.json` 通道更新。"
+              )
+              warning = (
+                  "**未含厂商/系统签名，但支持经过 Minisign 校验的应用内更新。**"
+                  if unsigned_release
+                  else
+                  "**未签名测试版本；更新包仍由项目 updater 密钥校验。**"
+              )
+              lines += [
+                  f"> {warning}",
+                  ">",
+                  f"> {channel_notice}",
+                  "> Windows 未经过 Authenticode 签名，会显示“未知发布者”或 SmartScreen 警告。",
+                  "> macOS 未经过 Developer ID 签名或公证，首次启动会触发 Gatekeeper。",
+                  "> iOS IPA 未经过 Apple 签名，只能使用 AltStore、Sideloadly 或 TrollStore 侧载。",
+                  "",
+              ]
+              lines += [
+                  "<!-- fanqie:unsigned-draft:start -->",
+                  "> ⏳ **本版本正在构建中**。",
+                  ">",
+                  f"> 📱 **计划平台**：{platforms}。",
+                  "> 构建和附件校验完成后，无签名专用 finalizer 会根据本版本真实 Assets 追加设备下载指引。",
+                  "",
+                  "<details>",
+                  "<summary>📦 Draft 构建信息</summary>",
+                  "",
+                  f"- 正在构建版本：`{version}`",
+                  f"- Tag：`{tag}`",
+                  f"- 源码引用：`{source_ref}`",
+                  f"- 源码提交：`{source_commit}`",
+                  f"- 计划平台：{platforms}",
+                  "",
+                  "</details>",
+                  "<!-- fanqie:unsigned-draft:end -->",
+                  "",
+              ]
+              Path("release-notes.md").write_text("\n".join(lines), encoding="utf-8")
+              print("Unsigned Draft notes ready; no historical download links were inserted.")
+              raise SystemExit(0)
+          lines += [
+              "> ⏳ **本版本正在构建中**。",
+              ">",
+              "> 📱 **当前支持**：Windows / Linux / macOS / Android；iOS 提供无签名 IPA（需自行侧载）。",
+              "",
+          ]
+          ios_ipa = []
+
+          if latest:
+              ltag = latest.get("tag_name") or ""
+              lname = latest.get("name") or ltag
+              base = f"https://github.com/{repo}/releases/download/{ltag}"
+              assets = [
+                  a.get("name", "")
+                  for a in (latest.get("assets") or [])
+                  if a.get("name")
+                  and not a["name"].endswith(".sig")
+                  and a["name"] not in {
+                      "latest.json", "SHA256SUMS-release.txt",
+                      "SHA256SUMS-android.txt", "SHA256SUMS-ios.txt", "SIGNING.txt",
+                      "THIRD_PARTY_LICENSES.html",
+                  }
+              ]
+              win_x64 = pick(assets, "windows-x64", ".exe")
+              win_arm = pick(assets, "windows-arm64", ".exe")
+              mac_arm = [n for n in pick(assets, "darwin-aarch64") if n.endswith(".dmg")]
+              mac_x64 = [n for n in pick(assets, "darwin-x64") if n.endswith(".dmg")]
+              deb_x64 = pick(assets, "linux-amd64", ".deb")
+              deb_arm = pick(assets, "linux-arm64", ".deb")
+              app_x64 = pick(assets, "amd64", ".appimage") or pick(assets, "amd64", ".AppImage")
+              # case-insensitive already via lower in pick for needles; AppImage may be mixed case
+              app_x64 = [n for n in assets if "amd64" in n.lower() and n.lower().endswith(".appimage")]
+              app_arm = [n for n in assets if ("aarch64" in n.lower() or "arm64" in n.lower()) and n.lower().endswith(".appimage")]
+              apk_arm64 = [n for n in assets if "arm64-v8a" in n.lower() and n.lower().endswith(".apk")]
+              apk_v7 = [n for n in assets if "armeabi-v7a" in n.lower() and n.lower().endswith(".apk")]
+              apk_x86 = [n for n in assets if "x86_64" in n.lower() and n.lower().endswith(".apk")]
+              apk_uni = [n for n in assets if "universal" in n.lower() and n.lower().endswith(".apk")]
+              if not apk_uni:
+                  apk_uni = [
+                      n for n in assets
+                      if n.lower().endswith(".apk")
+                      and all(
+                          marker not in n.lower()
+                          for marker in ("arm64-v8a", "armeabi-v7a", "x86_64")
+                      )
+                  ]
+              aab = [n for n in assets if n.lower().endswith(".aab")]
+              ios_ipa = [n for n in assets if n.lower().endswith(".ipa")]
+
+              lines += [
+                  f"> 🔗 下方下载链接**暂时指向最新已发布版本** [`{lname}`](https://github.com/{repo}/releases/tag/{ltag})。",
+                  "> 本版本构建完成后，链接会自动替换为本版本资源。",
+                  "",
+                  "## 下载地址（默认：最新已发布版本）",
+                  "",
+                  "### 🪟 Windows",
+                  "",
+                  "#### 安装包（推荐）",
+                  "",
+              ]
+              win_parts = []
+              if win_x64:
+                  win_parts.append(link(base, win_x64[0], "64位（常用）"))
+              if win_arm:
+                  win_parts.append(link(base, win_arm[0], "ARM64（Surface / 骁龙本）"))
+              lines.append("- " + (" | ".join(win_parts) if win_parts else "_暂无_"))
+              lines += ["", "### 🍎 macOS", ""]
+              mac_parts = []
+              if mac_arm:
+                  mac_parts.append(link(base, mac_arm[0], "Apple M 芯片（推荐）"))
+              if mac_x64:
+                  mac_parts.append(link(base, mac_x64[0], "Intel 芯片"))
+              lines.append("- " + (" | ".join(mac_parts) if mac_parts else "_暂无_"))
+              lines += ["", "### 🐧 Linux", "", "#### DEB 包（推荐）", ""]
+              deb_parts = []
+              if deb_x64:
+                  deb_parts.append(link(base, deb_x64[0], "64位"))
+              if deb_arm:
+                  deb_parts.append(link(base, deb_arm[0], "ARM64"))
+              lines.append("- " + (" | ".join(deb_parts) if deb_parts else "_暂无_"))
+              lines += ["", "#### AppImage", ""]
+              app_parts = []
+              if app_x64:
+                  app_parts.append(link(base, app_x64[0], "64位"))
+              if app_arm:
+                  app_parts.append(link(base, app_arm[0], "ARM64"))
+              lines.append("- " + (" | ".join(app_parts) if app_parts else "_暂无_"))
+              lines += ["", "### 🤖 Android", "", "#### 手机安装包", ""]
+              if apk_arm64:
+                  lines.append(f"- {link(base, apk_arm64[0], '64位 arm64-v8a（推荐）')}")
+              if apk_v7:
+                  lines.append(f"- {link(base, apk_v7[0], '32位 armeabi-v7a')}")
+              if apk_x86:
+                  lines.append(f"- {link(base, apk_x86[0], '模拟器 x86_64')}")
+              if apk_uni:
+                  lines.append(f"- {link(base, apk_uni[0], '通用版 universal')}")
+              if not apk_arm64 and not apk_v7 and not apk_x86 and not apk_uni:
+                  lines.append("- _暂无_")
+              lines += ["", "#### 应用商店包", ""]
+              if aab:
+                  lines.append(f"- {link(base, aab[0], 'AAB（上架用）')}")
+              else:
+                  lines.append("- _暂无_")
+          else:
+              lines += [
+                  "> 当前仓库还没有可指向的已发布资源，请稍后再看本页 Assets。",
+                  "",
+                  "## 下载地址",
+                  "",
+                  "_构建完成后自动生成各平台下载链接。_",
+              ]
+
+          lines += ["", "### 📱 iOS", ""]
+          if ios_ipa:
+              lines.append(f"- {link(base, ios_ipa[0], '无签名 IPA（侧载安装）')}")
+          else:
+              lines.append("_构建完成后会提供无签名 IPA，需自行用 AltStore / Sideloadly / TrollStore 等工具侧载安装。_")
+
+          lines += [
+              "",
+              "---",
+              "",
+              "### 💎 支持与推广",
+              "",
+              "如果这个项目对你有帮助，也欢迎支持一下合作服务：",
+              "",
+              "> 走邀请码注册即送 **1 美元**，不走邀请链接是没有的。麻烦各位体验一下了。",
+              "",
+              "- [注册链接（含邀请码）](https://999554.xyz/register?aff=Xf2p)",
+              "",
+              "### 🔗 相关链接",
+              "",
+              f"- [全部 Releases](https://github.com/{repo}/releases)",
+              f"- [问题反馈](https://github.com/{repo}/issues)",
+              f"- [项目说明](https://github.com/{repo})",
+              "",
+              "<details>",
+              "<summary>📦 构建信息</summary>",
+              "",
+              f"- 正在构建版本：`{version}`",
+              f"- Tag：`{tag}`",
+              f"- 源码引用：`{source_ref}`",
+              f"- 源码提交：`{source_commit}`",
+              f"- 计划平台：{platforms}",
+              "",
+              "</details>",
+              "",
+          ]
+          Path("release-notes.md").write_text("\n".join(lines), encoding="utf-8")
+          print("Draft notes ready; default download links target latest published release.")
+          PY
+
+          if [[ "${PUBLISH_UNSIGNED_PRERELEASE}" == "true" ]]; then
+            if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+              is_prerelease="$(gh release view "${TAG_NAME}" --json isPrerelease --jq .isPrerelease)"
+              if [[ "${is_prerelease}" != "true" ]]; then
+                echo "Refusing to reuse a non-prerelease tag: ${TAG_NAME}"
+                exit 1
+              fi
+              gh release view "${TAG_NAME}" --json body --jq .body > existing-release-notes.md
+              python scripts/merge-unsigned-draft-notes.py \
+                --existing existing-release-notes.md \
+                --generated release-notes.md \
+                --output merged-release-notes.md
+              gh release edit "${TAG_NAME}" \
+                --title "番茄小说下载器 未签名测试版 ${VERSION}" \
+                --notes-file merged-release-notes.md \
+                --prerelease
+            else
+              gh release create "${TAG_NAME}" \
+                --title "番茄小说下载器 未签名测试版 ${VERSION}" \
+                --notes-file release-notes.md \
+                --target "${GITHUB_SHA}" \
+                --draft \
+                --prerelease
+            fi
+          elif [[ "${PUBLISH_UNSIGNED_RELEASE}" == "true" ]]; then
+            if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+              is_prerelease="$(gh release view "${TAG_NAME}" --json isPrerelease --jq .isPrerelease)"
+              if [[ "${is_prerelease}" == "true" ]]; then
+                echo "Refusing to reuse a prerelease tag for an unsigned formal release: ${TAG_NAME}"
+                exit 1
+              fi
+              gh release view "${TAG_NAME}" --json body --jq .body > existing-release-notes.md
+              python scripts/merge-unsigned-draft-notes.py \
+                --existing existing-release-notes.md \
+                --generated release-notes.md \
+                --output merged-release-notes.md
+              gh release edit "${TAG_NAME}" \
+                --title "番茄小说下载器 未签名版 ${VERSION}" \
+                --notes-file merged-release-notes.md \
+                --draft
+            else
+              gh release create "${TAG_NAME}" \
+                --title "番茄小说下载器 未签名版 ${VERSION}" \
+                --notes-file release-notes.md \
+                --target "${GITHUB_SHA}" \
+                --draft
+            fi
+          elif gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            echo "Release already exists: ${TAG_NAME}"
+            gh release edit "${TAG_NAME}" --notes-file release-notes.md || true
+          elif [[ "${PRERELEASE}" == "true" ]]; then
+            gh release create "${TAG_NAME}" \
+              --title "番茄小说下载器 ${VERSION}" \
+              --notes-file release-notes.md \
+              --target "${GITHUB_SHA}" \
+              --draft \
+              --prerelease
+          else
+            gh release create "${TAG_NAME}" \
+              --title "番茄小说下载器 ${VERSION}" \
+              --notes-file release-notes.md \
+              --target "${GITHUB_SHA}" \
+              --draft
+          fi
+
+      - name: Resolve draft release ID
+        id: release-id
+        if: >-
+          inputs.publish_release == true ||
+          inputs.publish_unsigned_prerelease == true ||
+          inputs.publish_unsigned_release == true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          # 该 tag 必须恰好对应一个 Draft；出现同 tag 的多个 Release 时直接失败，
+          # 交给 maintenance-merge-drafts.yml 先合并。
+          python scripts/release-assets.py resolve \
+            --repo "${GH_REPO}" \
+            --tag "${TAG_NAME}" \
+            --require-draft \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Download third-party license list
+        if: steps.release-id.outputs.release_id != '' && needs.prepare.outputs.third_party_licenses == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: third-party-licenses
+          path: ${{ runner.temp }}/third-party-licenses
+
+      - name: Upload third-party license list
+        if: steps.release-id.outputs.release_id != '' && needs.prepare.outputs.third_party_licenses == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          RELEASE_ID: ${{ steps.release-id.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          python scripts/release-assets.py upload \
+            --repo "${GH_REPO}" \
+            --release-id "${RELEASE_ID}" \
+            --tag "${TAG_NAME}" \
+            "${RUNNER_TEMP}/third-party-licenses/THIRD_PARTY_LICENSES.html"
+
+  desktop:
+    # 不等 verify：构建只往 release-bootstrap 预建的 Draft 上传，Draft 不公开；
+    # finalize / finalize-unsigned-release 都要求 needs.verify.result == 'success'
+    # 才会发布，verify 失败时 Draft 留着，下次运行 prepare 会清掉。
+    needs: [prepare, release-bootstrap]
+    if: needs.prepare.outputs.desktop_count != '0'
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      # 桌面各平台并行构建。并行上传是安全的：
+      # - 所有附件都按 release-bootstrap 预建 Draft 的 ID 上传（338933b），
+      #   不会再按 tag 查找、另建第二个同 tag 草稿；
+      # - 各平台附件名互不相同（含 platform/arch），不会互相覆盖；
+      # - 唯一共享的是 tauri-action 读改写的 latest.json：并发时可能丢掉别的
+      #   平台条目或撞 404/422，tauri-action 会整体重试（retryAttempts），
+      #   而 finalize / finalize-unsigned-release 里的
+      #   normalize-updater-metadata.py 会按 Release 实际附件和 .sig 重建
+      #   全部 platforms，所以最终发布的 latest.json 与串行时一致。
+      matrix: ${{ fromJSON(needs.prepare.outputs.desktop_matrix) }}
+    runs-on: ${{ matrix.os }}
+    # Scarce ARM/Intel runners may fail; continue so desktop-fallback can cross-build.
+    continue-on-error: ${{ matrix.allow_fallback == true }}
+    timeout-minutes: 90
+    name: Desktop ${{ matrix.platform }}
+    steps:
+      - name: Quiet cargo / rustc output in public logs
+        # 公开日志不打印 rustc warning（会带源码片段）和 Compiling/Downloaded
+        # 依赖清单。RUSTFLAGS 是在已有值后追加，不覆盖；编译错误仍会打印。
+        shell: bash
+        run: |
+          {
+            echo "RUSTFLAGS=${RUSTFLAGS:+${RUSTFLAGS} }-Awarnings"
+            echo "CARGO_TERM_QUIET=true"
+          } >> "${GITHUB_ENV}"
+
+      - name: Checkout private Tauri source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ env.PRIVATE_SOURCE_REPOSITORY }}
+          ref: ${{ needs.prepare.outputs.source_ref }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+          persist-credentials: false
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+
+      - name: Download third-party license list
+        if: needs.prepare.outputs.third_party_licenses == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: third-party-licenses
+          path: ${{ env.PRIVATE_SOURCE_PATH }}/src-tauri/licenses
+
+      - name: Check bundled third-party license list
+        if: needs.prepare.outputs.third_party_licenses == 'true'
+        shell: bash
+        run: |
+          f="${PRIVATE_SOURCE_PATH}/src-tauri/licenses/THIRD_PARTY_LICENSES.html"
+          if [[ ! -s "${f}" ]] || grep -q "fanqie-third-party-licenses-placeholder" "${f}"; then
+            echo "::error::要打进安装包的第三方许可证清单仍是占位文件。"
+            exit 1
+          fi
+          echo "第三方许可证清单已就位"
+
+      - name: Checkout release wrapper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: release-wrapper
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Require pre-created release ID
+        if: inputs.publish_release == true || inputs.publish_unsigned_prerelease == true || inputs.publish_unsigned_release == true
+        shell: bash
+        env:
+          RELEASE_ID: ${{ needs.release-bootstrap.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          # 所有上传只认 release-bootstrap 预建的那个 Draft。拿不到 ID 就直接失败，
+          # 绝不退回按 tag 查找或另建草稿（那正是附件被拆到两个同 tag 草稿的原因）。
+          if [[ ! "${RELEASE_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::release-bootstrap 没有提供预建 Draft 的 Release ID，拒绝按 tag 查找或新建草稿"
+            exit 1
+          fi
+
+      - name: Validate macOS app icon
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          icon="${PRIVATE_SOURCE_PATH}/src-tauri/icons/icon.icns"
+          iconset="${RUNNER_TEMP}/fanqie-app-icon.iconset"
+          rm -rf "${iconset}"
+          iconutil -c iconset "${icon}" -o "${iconset}"
+          test -f "${iconset}/icon_512x512@2x.png"
+
+      - uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
+        with:
+          targets: ${{ matrix.target }}
+
+      # 只缓存公开依赖的编译产物：cache-workspace-crates=false 让 rust-cache 保存前清掉工作区 crate，
+      # 下面 job 末尾的 "Remove private build outputs before cache save" 再按名字兜底删一遍私有 crate；
+      # 只有 main 上的运行写缓存（fork PR 能读 main 的缓存，所以缓存里绝不能有私有源码的产物）。
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: ${{ env.PRIVATE_SOURCE_PATH }}/src-tauri -> target
+          key: desktop-${{ matrix.target }}
+          cache-workspace-crates: "false"
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install Tauri Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good
+          # Issue #392: tauri.conf.json sets bundle.linux.appimage
+          # .bundleMediaFramework, so linuxdeploy copies the GStreamer plugins
+          # from this build machine into the AppImage (the WebKit process fails
+          # to initialise on Debian 13 without them). The two plugin packages
+          # above provide the core elements (appsink/appsrc/autoaudiosink) that
+          # the bundler script expects in /usr/lib/<arch>-linux-gnu/gstreamer-1.0.
+
+      - name: Create release build config
+        shell: python
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+          CREATE_UPDATER_ARTIFACTS: ${{ needs.prepare.outputs.create_updater_artifacts }}
+          UPDATE_CHANNEL: ${{ needs.prepare.outputs.update_channel }}
+          APPLE_SIGNING_IDENTITY: ${{ !inputs.publish_unsigned_prerelease && !inputs.publish_unsigned_release && secrets.APPLE_SIGNING_IDENTITY || '' }}
+        run: |
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["PRIVATE_SOURCE_PATH"]) / "src-tauri" / "tauri.release.conf.json"
+          bundle = {
+              "createUpdaterArtifacts":
+                  os.environ["CREATE_UPDATER_ARTIFACTS"] == "true"
+          }
+          identity = os.environ.get("APPLE_SIGNING_IDENTITY", "").strip()
+          # 没有 Developer ID 时退回 ad-hoc 签名（"-"）。完全没有 bundle 签名封印的
+          # .app 带着 com.apple.quarantine 打开会被 Gatekeeper 判为“已损坏，无法打开”，
+          # 且系统不提供“仍要打开”入口。ad-hoc 签名可让其降级为可绕过的开发者验证提示。
+          if not identity:
+              identity = "-"
+          bundle["macOS"] = {"signingIdentity": identity}
+          endpoint = (
+              "https://github.com/POf-L/Fanqie-novel-Downloader/releases/download/"
+              f"{os.environ['UPDATE_CHANNEL']}/latest.json"
+          )
+          path.write_text(
+              json.dumps(
+                  {
+                      "version": os.environ["APP_VERSION"],
+                      "bundle": bundle,
+                      "plugins": {"updater": {"endpoints": [endpoint]}},
+                  },
+                  ensure_ascii=False,
+              ),
+              encoding="utf-8",
+          )
+
+      - name: Require Apple signing and notarization secrets
+        if: runner.os == 'macOS' && inputs.publish_release == true && !inputs.publish_unsigned_prerelease && !inputs.publish_unsigned_release
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "Publishing macOS artifacts requires ${name}."
+              exit 1
+            fi
+          done
+
+      - name: Export Apple signing credentials for Tauri
+        if: runner.os == 'macOS' && inputs.publish_release == true && !inputs.publish_unsigned_prerelease && !inputs.publish_unsigned_release
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            delimiter="FANQIE_${name}_${RANDOM}_EOF"
+            {
+              echo "${name}<<${delimiter}"
+              printf '%s\n' "${!name}"
+              echo "${delimiter}"
+            } >> "${GITHUB_ENV}"
+          done
+
+      - name: Build, sign updater artifacts and upload
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          FANQIE_UPDATE_CHANNEL: ${{ needs.prepare.outputs.update_channel }}
+        with:
+          projectPath: ${{ env.PRIVATE_SOURCE_PATH }}
+          # 构建输出（编译错误、链接命令、打包日志）只写 runner 本地临时文件，公开日志
+          # 只有通过/失败、退出码、用时；失败时提示去私有仓库本地复现。
+          tauriScript: node ${{ github.workspace }}/release-wrapper/scripts/silent-run.mjs --tauri
+          args: >-
+            --target ${{ matrix.target }}
+            --bundles ${{ matrix.bundles }}
+            --config src-tauri/tauri.release.conf.json
+          # The wrapper's finalizer owns the release asset allowlist and audit;
+          # do not mirror the private checkout into opaque tauri-action artifacts.
+          uploadWorkflowArtifacts: false
+          uploadUpdaterJson: ${{ needs.prepare.outputs.create_updater_artifacts == 'true' }}
+          uploadUpdaterSignatures: ${{ needs.prepare.outputs.create_updater_artifacts == 'true' }}
+          # 并行构建时多个 job 会同时读改写 latest.json，失败时多重试几次
+          # （每次随机等 1–10 秒后整体重读重写）。
+          retryAttempts: 5
+          workflowArtifactNamePattern: FanqieNovelDownloader-tauri-[platform]-[arch]-[bundle]
+          releaseAssetNamePattern: FanqieNovelDownloader-tauri-[platform]-[arch][setup][ext]
+          # User installers may have no OS/vendor signature, but updater assets
+          # are still signed by the dedicated Tauri key and uploaded to the draft.
+          # Upload straight into the Draft that release-bootstrap created, by ID.
+          # Never pass tagName here: tauri-action would look the Draft up in the
+          # release list and create a second same-tag Draft whenever it misses it.
+          releaseId: ${{ (inputs.publish_release || inputs.publish_unsigned_prerelease || inputs.publish_unsigned_release) && needs.prepare.outputs.create_updater_artifacts == 'true' && needs.release-bootstrap.outputs.release_id || '' }}
+          # Only used as the notes field of latest.json; no release is created.
+          releaseBody: Rust + Tauri v2 全平台正式构建。
+
+      - name: Stage, sign and upload Windows portable executable
+        if: runner.os == 'Windows' && (inputs.publish_release == true || inputs.publish_unsigned_prerelease == true || inputs.publish_unsigned_release == true)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          RELEASE_ID: ${{ needs.release-bootstrap.outputs.release_id }}
+          SOURCE_PATH: ${{ env.PRIVATE_SOURCE_PATH }}
+          TARGET: ${{ matrix.target }}
+          CREATE_UPDATER_ARTIFACTS: ${{ needs.prepare.outputs.create_updater_artifacts }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $arch = if ($env:TARGET.StartsWith('aarch64-')) { 'arm64' } else { 'x64' }
+          $binary = Join-Path $env:SOURCE_PATH ("src-tauri/target/{0}/release/fanqie-desktop.exe" -f $env:TARGET)
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw "缺少便捷版可执行文件: $binary" }
+          $output = Join-Path $env:RUNNER_TEMP ("windows-portable-{0}" -f $arch)
+          New-Item -ItemType Directory -Path $output -Force | Out-Null
+          $portable = Join-Path $output ("FanqieNovelDownloader-tauri-windows-{0}-portable.exe" -f $arch)
+          Copy-Item -LiteralPath $binary -Destination $portable -Force
+          $uploads = @($portable)
+          if ($env:CREATE_UPDATER_ARTIFACTS -eq 'true') {
+            if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY) -or [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
+              throw '缺少便携版 updater 签名密钥'
+            }
+            npm install --global "@tauri-apps/cli@$env:TAURI_CLI_VERSION"
+            tauri signer sign $portable
+            $signature = "$portable.sig"
+            if (-not (Test-Path -LiteralPath $signature -PathType Leaf) -or (Get-Item -LiteralPath $signature).Length -le 0) {
+              throw "便携版签名生成失败: $signature"
+            }
+            $uploads += $signature
+          }
+          $uploader = Join-Path $env:GITHUB_WORKSPACE 'release-wrapper/scripts/release-assets.py'
+          python $uploader upload --repo $env:GH_REPO --release-id $env:RELEASE_ID --tag $env:TAG_NAME @uploads
+          if ($LASTEXITCODE -ne 0) { throw "便携版上传失败（Release ID $env:RELEASE_ID）" }
+
+      - name: Verify unsigned macOS bundle before upload
+        if: runner.os == 'macOS' && (inputs.publish_unsigned_prerelease == true || inputs.publish_unsigned_release == true)
+        shell: bash
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bundle_root="${PRIVATE_SOURCE_PATH}/src-tauri/target/${MATRIX_TARGET}/release/bundle"
+          app_path="$(find "${bundle_root}/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          dmg_path="$(find "${bundle_root}/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          test -n "${app_path}"
+          test -n "${dmg_path}"
+          test -d "${app_path}/Contents/_CodeSignature"
+          codesign --verify --deep --strict --verbose=2 "${app_path}"
+          codesign -dvv "${app_path}" 2>&1 | grep -Fqx "Signature=adhoc"
+          hdiutil verify "${dmg_path}"
+
+      - name: Upload unsigned desktop installers
+        if: inputs.publish_unsigned_prerelease == true || inputs.publish_unsigned_release == true
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          RELEASE_ID: ${{ needs.release-bootstrap.outputs.release_id }}
+          SOURCE_PATH: ${{ env.PRIVATE_SOURCE_PATH }}
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          CREATE_UPDATER_ARTIFACTS: ${{ needs.prepare.outputs.create_updater_artifacts }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          import os
+          import shutil
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          uploader = str(
+              Path(os.environ["GITHUB_WORKSPACE"])
+              / "release-wrapper"
+              / "scripts"
+              / "release-assets.py"
+          )
+          release_target = [
+              "--repo",
+              os.environ["GH_REPO"],
+              "--release-id",
+              os.environ.get("RELEASE_ID", ""),
+              "--tag",
+              os.environ["TAG_NAME"],
+          ]
+
+          source = (
+              Path(os.environ["SOURCE_PATH"])
+              / "src-tauri"
+              / "target"
+              / os.environ["TARGET"]
+              / "release"
+              / "bundle"
+          )
+          output = Path(os.environ["RUNNER_TEMP"]) / (
+              "unsigned-desktop-" + os.environ["PLATFORM"]
+          )
+          output.mkdir(parents=True, exist_ok=True)
+
+          def single(directory: Path, suffix: str) -> Path:
+              matches = sorted(
+                  path for path in directory.glob("*")
+                  if path.is_file() and path.name.lower().endswith(suffix.lower())
+              )
+              if len(matches) != 1:
+                  raise SystemExit(
+                      f"expected exactly one {suffix} in {directory}, "
+                      f"found {len(matches)}"
+              )
+              return matches[0]
+
+          def single_directory(directory: Path, suffix: str) -> Path:
+              matches = sorted(
+                  path for path in directory.glob("*")
+                  if path.is_dir() and path.name.lower().endswith(suffix.lower())
+              )
+              if len(matches) != 1:
+                  raise SystemExit(
+                      f"expected exactly one directory ending {suffix} in "
+                      f"{directory}, found {len(matches)}"
+                  )
+              return matches[0]
+
+          target = os.environ["TARGET"]
+          platform = os.environ["PLATFORM"]
+          appimage = None
+          appimage_arch = ""
+          if target.endswith("-pc-windows-msvc"):
+              arch = "arm64" if target.startswith("aarch64-") else "x64"
+              source_file = single(source / "nsis", "-setup.exe")
+              destination = output / f"FanqieNovelDownloader-tauri-windows-{arch}-setup.exe"
+              shutil.copy2(source_file, destination)
+          elif target.endswith("-unknown-linux-gnu"):
+              arch = "arm64" if target.startswith("aarch64-") else "amd64"
+              stem = f"FanqieNovelDownloader-tauri-linux-{arch}"
+              appimage_arch = "aarch64" if target.startswith("aarch64-") else "amd64"
+              deb = single(source / "deb", ".deb")
+              shutil.copy2(deb, output / f"{stem}.deb")
+              appimages = sorted(
+                  path for path in (source / "appimage").glob("*")
+                  if path.is_file() and path.suffix.lower() == ".appimage"
+              )
+              if appimages:
+                  if len(appimages) != 1:
+                      raise SystemExit(
+                          f"expected at most one AppImage, found {len(appimages)}"
+                      )
+                  # AppImage 名称不带 "linux"：AppImage 本身就只在 Linux 上跑，
+                  # 应用目录（AppImageHub）也要求名字里不要出现 Linux。
+                  appimage = output / f"FanqieNovelDownloader-tauri-{appimage_arch}.AppImage"
+                  shutil.copy2(appimages[0], appimage)
+          elif target.endswith("-apple-darwin"):
+              arch = "aarch64" if target.startswith("aarch64-") else "x64"
+              stem = f"FanqieNovelDownloader-tauri-darwin-{arch}"
+              dmg = single(source / "dmg", ".dmg")
+              shutil.copy2(dmg, output / f"{stem}.dmg")
+              app = single_directory(source / "macos", ".app")
+              subprocess.run(
+                  [
+                      "ditto",
+                      "-c",
+                      "-k",
+                      "--sequesterRsrc",
+                      "--keepParent",
+                      str(app),
+                      str(output / f"{stem}.zip"),
+                  ],
+                  check=True,
+              )
+          else:
+              raise SystemExit(f"unsupported unsigned target: {target}")
+
+          # 改名后必须重新签名：updater 校验要求 <资产名>.sig 成对存在，而
+          # tauri-action 只会为它自己那套旧名产物生成签名。
+          if appimage is not None and os.environ.get("CREATE_UPDATER_ARTIFACTS") == "true":
+              if not os.environ.get("TAURI_SIGNING_PRIVATE_KEY") or not os.environ.get(
+                  "TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+              ):
+                  raise SystemExit("缺少 AppImage updater 签名密钥")
+              if shutil.which("tauri") is None:
+                  subprocess.run(
+                      [
+                          "npm",
+                          "install",
+                          "--global",
+                          f"@tauri-apps/cli@{os.environ['TAURI_CLI_VERSION']}",
+                      ],
+                      check=True,
+                  )
+              subprocess.run(["tauri", "signer", "sign", str(appimage)], check=True)
+              if not Path(f"{appimage}.sig").is_file():
+                  raise SystemExit(f"AppImage 签名生成失败: {appimage}.sig")
+
+          assets = sorted(output.iterdir())
+          if not assets or any(not asset.is_file() for asset in assets):
+              raise SystemExit("unsigned desktop asset directory is invalid")
+          forbidden = (".nsis.zip", ".msi.zip", ".app.tar.gz", ".appimage.tar.gz")
+          if any(asset.name.lower().endswith(forbidden) for asset in assets):
+              raise SystemExit("refusing to upload updater artifacts")
+          expected_signature = f"{appimage.name}.sig" if appimage is not None else ""
+          if any(
+              asset.name.lower().endswith(".sig") and asset.name != expected_signature
+              for asset in assets
+          ):
+              raise SystemExit("unsigned desktop asset directory has unexpected signatures")
+          subprocess.run(
+              [
+                  sys.executable,
+                  uploader,
+                  "upload",
+                  *release_target,
+                  *(str(asset) for asset in assets),
+              ],
+              check=True,
+              env=os.environ.copy(),
+          )
+          if appimage is not None:
+              # tauri-action 先以旧名上传了同一份 AppImage 及其签名；删掉旧名，
+              # 否则 Release 会同时挂两个 AppImage，且残留签名会被
+              # normalize-updater-metadata.py 判为未知签名资产。
+              stale = f"FanqieNovelDownloader-tauri-linux-{appimage_arch}.AppImage"
+              subprocess.run(
+                  [
+                      sys.executable,
+                      uploader,
+                      "delete",
+                      *release_target,
+                      stale,
+                      f"{stale}.sig",
+                  ],
+                  check=True,
+                  env=os.environ.copy(),
+              )
+
+      - name: Verify macOS signing and notarization
+        if: runner.os == 'macOS' && inputs.publish_release == true && !inputs.publish_unsigned_prerelease && !inputs.publish_unsigned_release
+        shell: bash
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: |
+          app_path="$(find "${PRIVATE_SOURCE_PATH}/src-tauri/target/${MATRIX_TARGET}/release/bundle/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "${app_path}"
+          test -d "${app_path}/Contents/_CodeSignature"
+          codesign --verify --deep --strict --verbose=2 "${app_path}"
+          spctl --assess --type execute --verbose=2 "${app_path}"
+
+      - name: Remove private build outputs before cache save
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${PRIVATE_SOURCE_PATH}/src-tauri/target"
+          [[ -d "${target}" ]] || exit 0
+          # 私有 crate 的编译产物、增量编译数据和打包目录都不进缓存。
+          find "${target}" -type d \( -name 'incremental' -o -name 'bundle' \) -prune -exec rm -rf {} + 2>/dev/null || true
+          find "${target}" \( -name '*fanqie*' -o -name '*account_auth*' -o -name '*account-auth*' \) -prune -exec rm -rf {} + 2>/dev/null || true
+          if find "${target}" \( -name '*fanqie*' -o -name '*account_auth*' -o -name '*account-auth*' \) -print -quit | grep -q .; then
+            # 删不干净就整个 target 都不缓存，宁可这次没有缓存也不让私有产物进缓存。
+            echo "::warning::target 里还有私有 crate 的产物，这次不缓存 target。"
+            rm -rf "${target}"
+          fi
+
+  # When scarce native runners fail (resource pressure / OOM / unavailable),
+  # cross-compile the same targets on more available x64/arm64 runners.
+  desktop-fallback:
+    needs: [prepare, verify, release-bootstrap, desktop]
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      needs.verify.result == 'success' &&
+      needs.release-bootstrap.result == 'success' &&
+      needs.prepare.outputs.desktop_fallback_count != '0' &&
+      needs.desktop.result != 'cancelled'
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      # 与 desktop 相同：按 Draft ID 上传、附件名按平台区分，latest.json 由
+      # finalize 统一重建，可以并行。
+      matrix: ${{ fromJSON(needs.prepare.outputs.desktop_fallback_matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    name: Desktop fallback ${{ matrix.platform }} (cross on ${{ matrix.os }})
+    steps:
+      - name: Quiet cargo / rustc output in public logs
+        # 公开日志不打印 rustc warning（会带源码片段）和 Compiling/Downloaded
+        # 依赖清单。RUSTFLAGS 是在已有值后追加，不覆盖；编译错误仍会打印。
+        shell: bash
+        run: |
+          {
+            echo "RUSTFLAGS=${RUSTFLAGS:+${RUSTFLAGS} }-Awarnings"
+            echo "CARGO_TERM_QUIET=true"
+          } >> "${GITHUB_ENV}"
+
+      - name: Checkout release wrapper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: release-wrapper
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Require pre-created release ID
+        if: inputs.publish_release == true || inputs.publish_unsigned_prerelease == true || inputs.publish_unsigned_release == true
+        shell: bash
+        env:
+          RELEASE_ID: ${{ needs.release-bootstrap.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          # 所有上传只认 release-bootstrap 预建的那个 Draft。拿不到 ID 就直接失败，
+          # 绝不退回按 tag 查找或另建草稿（那正是附件被拆到两个同 tag 草稿的原因）。
+          if [[ ! "${RELEASE_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::release-bootstrap 没有提供预建 Draft 的 Release ID，拒绝按 tag 查找或新建草稿"
+            exit 1
+          fi
+
+      - name: Check whether native build already uploaded assets
+        id: need
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          RELEASE_ID: ${{ needs.release-bootstrap.outputs.release_id }}
+          ASSET_SUBSTR: ${{ matrix.asset_substr }}
+          RELEASE_ENABLED: ${{ inputs.publish_release || inputs.publish_unsigned_prerelease || inputs.publish_unsigned_release }}
+          PUBLISH_UNSIGNED_PRERELEASE: ${{ inputs.publish_unsigned_prerelease }}
+          PUBLISH_UNSIGNED_RELEASE: ${{ inputs.publish_unsigned_release }}
+          CREATE_UPDATER_ARTIFACTS: ${{ needs.prepare.outputs.create_updater_artifacts }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [[ "${RELEASE_ENABLED}" != "true" ]]; then
+            # Without a release, always attempt fallback if this job ran
+            # (native may have failed without artifacts).
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          # 只看 release-bootstrap 预建的 Draft；读不到就失败，不按 tag 猜。
+          assets="$(python release-wrapper/scripts/release-assets.py list \
+            --repo "${GH_REPO}" \
+            --release-id "${RELEASE_ID}" \
+            --tag "${TAG_NAME}" | tr -d '\r')"
+          if [[ "${TARGET}" == *-pc-windows-msvc ]]; then
+            arch="$([[ "${TARGET}" == aarch64-* ]] && echo arm64 || echo x64)"
+            setup="FanqieNovelDownloader-tauri-windows-${arch}-setup.exe"
+            portable="FanqieNovelDownloader-tauri-windows-${arch}-portable.exe"
+            expected_assets=("${setup}" "${portable}")
+            if [[ "${CREATE_UPDATER_ARTIFACTS}" == "true" ]]; then
+              expected_assets+=("${setup}.sig" "${portable}.sig")
+            fi
+            found=true
+            for expected in "${expected_assets[@]}"; do
+              if ! printf '%s\n' "${assets}" | grep -Fx "${expected}" >/dev/null 2>&1; then
+                found=false
+                break
+              fi
+            done
+          elif [[ "${PUBLISH_UNSIGNED_PRERELEASE}" == "true" ||
+                "${PUBLISH_UNSIGNED_RELEASE}" == "true" ]]; then
+            case "${TARGET}" in
+              *-unknown-linux-gnu)
+                expected_arch="$([[ "${TARGET}" == aarch64-* ]] && echo arm64 || echo amd64)"
+                expected="FanqieNovelDownloader-tauri-linux-${expected_arch}.deb"
+                ;;
+              x86_64-apple-darwin)
+                expected="FanqieNovelDownloader-tauri-darwin-x64.dmg"
+                ;;
+              aarch64-apple-darwin)
+                expected="FanqieNovelDownloader-tauri-darwin-aarch64.dmg"
+                ;;
+              *)
+                echo "Unsupported fallback target: ${TARGET}"
+                exit 1
+                ;;
+            esac
+            found=false
+            while IFS= read -r asset; do
+              if [[ "${asset}" == "${expected}" ]]; then
+                found=true
+                break
+              fi
+            done <<< "${assets}"
+          else
+            found=false
+            if printf '%s\n' "${assets}" | grep -F "${ASSET_SUBSTR}" >/dev/null 2>&1; then
+              found=true
+            fi
+          fi
+          if [[ "${found}" == "true" ]]; then
+            echo "Native (or prior) assets already present for ${ASSET_SUBSTR}; skip cross fallback."
+            echo "run=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Missing release assets matching ${ASSET_SUBSTR}; starting cross fallback."
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Checkout private Tauri source
+        if: steps.need.outputs.run == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ env.PRIVATE_SOURCE_REPOSITORY }}
+          ref: ${{ needs.prepare.outputs.source_ref }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+          persist-credentials: false
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+
+      - name: Download third-party license list
+        if: needs.prepare.outputs.third_party_licenses == 'true' && steps.need.outputs.run == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: third-party-licenses
+          path: ${{ env.PRIVATE_SOURCE_PATH }}/src-tauri/licenses
+
+      - name: Check bundled third-party license list
+        if: needs.prepare.outputs.third_party_licenses == 'true' && steps.need.outputs.run == 'true'
+        shell: bash
+        run: |
+          f="${PRIVATE_SOURCE_PATH}/src-tauri/licenses/THIRD_PARTY_LICENSES.html"
+          if [[ ! -s "${f}" ]] || grep -q "fanqie-third-party-licenses-placeholder" "${f}"; then
+            echo "::error::要打进安装包的第三方许可证清单仍是占位文件。"
+            exit 1
+          fi
+          echo "第三方许可证清单已就位"
+
+      - name: Validate macOS app icon
+        if: steps.need.outputs.run == 'true' && runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          icon="${PRIVATE_SOURCE_PATH}/src-tauri/icons/icon.icns"
+          iconset="${RUNNER_TEMP}/fanqie-app-icon.iconset"
+          rm -rf "${iconset}"
+          iconutil -c iconset "${icon}" -o "${iconset}"
+          test -f "${iconset}/icon_512x512@2x.png"
+
+      - name: Install Rust toolchain (cross target)
+        if: steps.need.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install ARM64 cross-compile environment (multiarch)
+        if: steps.need.outputs.run == 'true' && runner.os == 'Linux'
+        # 以前只装了 x64 的 WebKitGTK，pkg-config 给出的是 x64 库，arm64 链接找不到
+        # glib 等库。脚本改用 multiarch 装 arm64 开发包，并只对 aarch64 目标设 pkg-config。
+        run: bash release-wrapper/scripts/setup-linux-arm64-cross.sh
+
+      - name: Create release build config
+        if: steps.need.outputs.run == 'true'
+        shell: python
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+          CREATE_UPDATER_ARTIFACTS: ${{ needs.prepare.outputs.create_updater_artifacts }}
+          UPDATE_CHANNEL: ${{ needs.prepare.outputs.update_channel }}
+          APPLE_SIGNING_IDENTITY: ${{ !inputs.publish_unsigned_prerelease && !inputs.publish_unsigned_release && secrets.APPLE_SIGNING_IDENTITY || '' }}
+        run: |
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["PRIVATE_SOURCE_PATH"]) / "src-tauri" / "tauri.release.conf.json"
+          bundle = {
+              "createUpdaterArtifacts":
+                  os.environ["CREATE_UPDATER_ARTIFACTS"] == "true"
+          }
+          identity = os.environ.get("APPLE_SIGNING_IDENTITY", "").strip()
+          # 没有 Developer ID 时退回 ad-hoc 签名（"-"）。完全没有 bundle 签名封印的
+          # .app 带着 com.apple.quarantine 打开会被 Gatekeeper 判为“已损坏，无法打开”，
+          # 且系统不提供“仍要打开”入口。ad-hoc 签名可让其降级为可绕过的开发者验证提示。
+          if not identity:
+              identity = "-"
+          bundle["macOS"] = {"signingIdentity": identity}
+          endpoint = (
+              "https://github.com/POf-L/Fanqie-novel-Downloader/releases/download/"
+              f"{os.environ['UPDATE_CHANNEL']}/latest.json"
+          )
+          path.write_text(
+              json.dumps(
+                  {
+                      "version": os.environ["APP_VERSION"],
+                      "bundle": bundle,
+                      "plugins": {"updater": {"endpoints": [endpoint]}},
+                  },
+                  ensure_ascii=False,
+              ),
+              encoding="utf-8",
+          )
+
+      - name: Require Apple signing and notarization secrets
+        if: steps.need.outputs.run == 'true' && runner.os == 'macOS' && inputs.publish_release == true && !inputs.publish_unsigned_prerelease && !inputs.publish_unsigned_release
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "Publishing macOS artifacts requires ${name}."
+              exit 1
+            fi
+          done
+
+      - name: Export Apple signing credentials for Tauri
+        if: steps.need.outputs.run == 'true' && runner.os == 'macOS' && inputs.publish_release == true && !inputs.publish_unsigned_prerelease && !inputs.publish_unsigned_release
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            delimiter="FANQIE_${name}_${RANDOM}_EOF"
+            {
+              echo "${name}<<${delimiter}"
+              printf '%s\n' "${!name}"
+              echo "${delimiter}"
+            } >> "${GITHUB_ENV}"
+          done
+
+      - name: Cross-build, sign updater artifacts and upload
+        if: steps.need.outputs.run == 'true'
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          FANQIE_UPDATE_CHANNEL: ${{ needs.prepare.outputs.update_channel }}
+        with:
+          projectPath: ${{ env.PRIVATE_SOURCE_PATH }}
+          # 构建输出（编译错误、链接命令、打包日志）只写 runner 本地临时文件，公开日志
+          # 只有通过/失败、退出码、用时；失败时提示去私有仓库本地复现。
+          tauriScript: node ${{ github.workspace }}/release-wrapper/scripts/silent-run.mjs --tauri
+          args: >-
+            --target ${{ matrix.target }}
+            --bundles ${{ matrix.bundles }}
+            --config src-tauri/tauri.release.conf.json
+          # The wrapper's finalizer owns the release asset allowlist and audit;
+          # do not mirror the private checkout into opaque tauri-action artifacts.
+          uploadWorkflowArtifacts: false
+          uploadUpdaterJson: ${{ needs.prepare.outputs.create_updater_artifacts == 'true' }}
+          uploadUpdaterSignatures: ${{ needs.prepare.outputs.create_updater_artifacts == 'true' }}
+          retryAttempts: 5
+          workflowArtifactNamePattern: FanqieNovelDownloader-tauri-[platform]-[arch]-fallback-[bundle]
+          releaseAssetNamePattern: FanqieNovelDownloader-tauri-[platform]-[arch][setup][ext]
+          # User installers may have no OS/vendor signature, but updater assets
+          # are still signed by the dedicated Tauri key and uploaded to the draft.
+          # Upload straight into the Draft that release-bootstrap created, by ID.
+          # Never pass tagName here: tauri-action would look the Draft up in the
+          # release list and create a second same-tag Draft whenever it misses it.
+          releaseId: ${{ (inputs.publish_release || inputs.publish_unsigned_prerelease || inputs.publish_unsigned_release) && needs.prepare.outputs.create_updater_artifacts == 'true' && needs.release-bootstrap.outputs.release_id || '' }}
+          # Only used as the notes field of latest.json; no release is created.
+          releaseBody: Rust + Tauri v2 全平台正式构建（含稀缺 runner 交叉回退）。
+
+      - name: Stage, sign and upload Windows portable executable
+        if: steps.need.outputs.run == 'true' && runner.os == 'Windows' && (inputs.publish_release == true || inputs.publish_unsigned_prerelease == true || inputs.publish_unsigned_release == true)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          RELEASE_ID: ${{ needs.release-bootstrap.outputs.release_id }}
+          SOURCE_PATH: ${{ env.PRIVATE_SOURCE_PATH }}
+          TARGET: ${{ matrix.target }}
+          CREATE_UPDATER_ARTIFACTS: ${{ needs.prepare.outputs.create_updater_artifacts }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $arch = if ($env:TARGET.StartsWith('aarch64-')) { 'arm64' } else { 'x64' }
+          $binary = Join-Path $env:SOURCE_PATH ("src-tauri/target/{0}/release/fanqie-desktop.exe" -f $env:TARGET)
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw "缺少便捷版可执行文件: $binary" }
+          $output = Join-Path $env:RUNNER_TEMP ("windows-portable-{0}" -f $arch)
+          New-Item -ItemType Directory -Path $output -Force | Out-Null
+          $portable = Join-Path $output ("FanqieNovelDownloader-tauri-windows-{0}-portable.exe" -f $arch)
+          Copy-Item -LiteralPath $binary -Destination $portable -Force
+          $uploads = @($portable)
+          if ($env:CREATE_UPDATER_ARTIFACTS -eq 'true') {
+            if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY) -or [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
+              throw '缺少便携版 updater 签名密钥'
+            }
+            npm install --global "@tauri-apps/cli@$env:TAURI_CLI_VERSION"
+            tauri signer sign $portable
+            $signature = "$portable.sig"
+            if (-not (Test-Path -LiteralPath $signature -PathType Leaf) -or (Get-Item -LiteralPath $signature).Length -le 0) {
+              throw "便携版签名生成失败: $signature"
+            }
+            $uploads += $signature
+          }
+          $uploader = Join-Path $env:GITHUB_WORKSPACE 'release-wrapper/scripts/release-assets.py'
+          python $uploader upload --repo $env:GH_REPO --release-id $env:RELEASE_ID --tag $env:TAG_NAME @uploads
+          if ($LASTEXITCODE -ne 0) { throw "便携版上传失败（Release ID $env:RELEASE_ID）" }
+
+      - name: Verify unsigned macOS bundle before upload
+        if: steps.need.outputs.run == 'true' && runner.os == 'macOS' && (inputs.publish_unsigned_prerelease == true || inputs.publish_unsigned_release == true)
+        shell: bash
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bundle_root="${PRIVATE_SOURCE_PATH}/src-tauri/target/${MATRIX_TARGET}/release/bundle"
+          app_path="$(find "${bundle_root}/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          dmg_path="$(find "${bundle_root}/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          test -n "${app_path}"
+          test -n "${dmg_path}"
+          test -d "${app_path}/Contents/_CodeSignature"
+          codesign --verify --deep --strict --verbose=2 "${app_path}"
+          codesign -dvv "${app_path}" 2>&1 | grep -Fqx "Signature=adhoc"
+          hdiutil verify "${dmg_path}"
+
+      - name: Upload unsigned desktop installers
+        if: steps.need.outputs.run == 'true' && (inputs.publish_unsigned_prerelease == true || inputs.publish_unsigned_release == true)
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          RELEASE_ID: ${{ needs.release-bootstrap.outputs.release_id }}
+          SOURCE_PATH: ${{ env.PRIVATE_SOURCE_PATH }}
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          CREATE_UPDATER_ARTIFACTS: ${{ needs.prepare.outputs.create_updater_artifacts }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          import os
+          import shutil
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          uploader = str(
+              Path(os.environ["GITHUB_WORKSPACE"])
+              / "release-wrapper"
+              / "scripts"
+              / "release-assets.py"
+          )
+          release_target = [
+              "--repo",
+              os.environ["GH_REPO"],
+              "--release-id",
+              os.environ.get("RELEASE_ID", ""),
+              "--tag",
+              os.environ["TAG_NAME"],
+          ]
+
+          source = (
+              Path(os.environ["SOURCE_PATH"])
+              / "src-tauri"
+              / "target"
+              / os.environ["TARGET"]
+              / "release"
+              / "bundle"
+          )
+          output = Path(os.environ["RUNNER_TEMP"]) / (
+              "unsigned-desktop-" + os.environ["PLATFORM"]
+          )
+          output.mkdir(parents=True, exist_ok=True)
+
+          def single(directory: Path, suffix: str) -> Path:
+              matches = sorted(
+                  path for path in directory.glob("*")
+                  if path.is_file() and path.name.lower().endswith(suffix.lower())
+              )
+              if len(matches) != 1:
+                  raise SystemExit(
+                      f"expected exactly one {suffix} in {directory}, "
+                      f"found {len(matches)}"
+              )
+              return matches[0]
+
+          def single_directory(directory: Path, suffix: str) -> Path:
+              matches = sorted(
+                  path for path in directory.glob("*")
+                  if path.is_dir() and path.name.lower().endswith(suffix.lower())
+              )
+              if len(matches) != 1:
+                  raise SystemExit(
+                      f"expected exactly one directory ending {suffix} in "
+                      f"{directory}, found {len(matches)}"
+                  )
+              return matches[0]
+
+          target = os.environ["TARGET"]
+          platform = os.environ["PLATFORM"]
+          appimage = None
+          appimage_arch = ""
+          if target.endswith("-pc-windows-msvc"):
+              arch = "arm64" if target.startswith("aarch64-") else "x64"
+              source_file = single(source / "nsis", "-setup.exe")
+              destination = output / f"FanqieNovelDownloader-tauri-windows-{arch}-setup.exe"
+              shutil.copy2(source_file, destination)
+          elif target.endswith("-unknown-linux-gnu"):
+              arch = "arm64" if target.startswith("aarch64-") else "amd64"
+              stem = f"FanqieNovelDownloader-tauri-linux-{arch}"
+              appimage_arch = "aarch64" if target.startswith("aarch64-") else "amd64"
+              deb = single(source / "deb", ".deb")
+              shutil.copy2(deb, output / f"{stem}.deb")
+              appimages = sorted(
+                  path for path in (source / "appimage").glob("*")
+                  if path.is_file() and path.suffix.lower() == ".appimage"
+              )
+              if appimages:
+                  if len(appimages) != 1:
+                      raise SystemExit(
+                          f"expected at most one AppImage, found {len(appimages)}"
+                      )
+                  # AppImage 名称不带 "linux"：AppImage 本身就只在 Linux 上跑，
+                  # 应用目录（AppImageHub）也要求名字里不要出现 Linux。
+                  appimage = output / f"FanqieNovelDownloader-tauri-{appimage_arch}.AppImage"
+                  shutil.copy2(appimages[0], appimage)
+          elif target.endswith("-apple-darwin"):
+              arch = "aarch64" if target.startswith("aarch64-") else "x64"
+              stem = f"FanqieNovelDownloader-tauri-darwin-{arch}"
+              dmg = single(source / "dmg", ".dmg")
+              shutil.copy2(dmg, output / f"{stem}.dmg")
+              app = single_directory(source / "macos", ".app")
+              subprocess.run(
+                  [
+                      "ditto",
+                      "-c",
+                      "-k",
+                      "--sequesterRsrc",
+                      "--keepParent",
+                      str(app),
+                      str(output / f"{stem}.zip"),
+                  ],
+                  check=True,
+              )
+          else:
+              raise SystemExit(f"unsupported unsigned target: {target}")
+
+          # 改名后必须重新签名：updater 校验要求 <资产名>.sig 成对存在，而
+          # tauri-action 只会为它自己那套旧名产物生成签名。
+          if appimage is not None and os.environ.get("CREATE_UPDATER_ARTIFACTS") == "true":
+              if not os.environ.get("TAURI_SIGNING_PRIVATE_KEY") or not os.environ.get(
+                  "TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+              ):
+                  raise SystemExit("缺少 AppImage updater 签名密钥")
+              if shutil.which("tauri") is None:
+                  subprocess.run(
+                      [
+                          "npm",
+                          "install",
+                          "--global",
+                          f"@tauri-apps/cli@{os.environ['TAURI_CLI_VERSION']}",
+                      ],
+                      check=True,
+                  )
+              subprocess.run(["tauri", "signer", "sign", str(appimage)], check=True)
+              if not Path(f"{appimage}.sig").is_file():
+                  raise SystemExit(f"AppImage 签名生成失败: {appimage}.sig")
+
+          assets = sorted(output.iterdir())
+          if not assets or any(not asset.is_file() for asset in assets):
+              raise SystemExit("unsigned desktop asset directory is invalid")
+          forbidden = (".nsis.zip", ".msi.zip", ".app.tar.gz", ".appimage.tar.gz")
+          if any(asset.name.lower().endswith(forbidden) for asset in assets):
+              raise SystemExit("refusing to upload updater artifacts")
+          expected_signature = f"{appimage.name}.sig" if appimage is not None else ""
+          if any(
+              asset.name.lower().endswith(".sig") and asset.name != expected_signature
+              for asset in assets
+          ):
+              raise SystemExit("unsigned desktop asset directory has unexpected signatures")
+          subprocess.run(
+              [
+                  sys.executable,
+                  uploader,
+                  "upload",
+                  *release_target,
+                  *(str(asset) for asset in assets),
+              ],
+              check=True,
+              env=os.environ.copy(),
+          )
+          if appimage is not None:
+              # tauri-action 先以旧名上传了同一份 AppImage 及其签名；删掉旧名，
+              # 否则 Release 会同时挂两个 AppImage，且残留签名会被
+              # normalize-updater-metadata.py 判为未知签名资产。
+              stale = f"FanqieNovelDownloader-tauri-linux-{appimage_arch}.AppImage"
+              subprocess.run(
+                  [
+                      sys.executable,
+                      uploader,
+                      "delete",
+                      *release_target,
+                      stale,
+                      f"{stale}.sig",
+                  ],
+                  check=True,
+                  env=os.environ.copy(),
+              )
+
+      - name: Verify macOS signing and notarization
+        if: steps.need.outputs.run == 'true' && runner.os == 'macOS' && inputs.publish_release == true && !inputs.publish_unsigned_prerelease && !inputs.publish_unsigned_release
+        shell: bash
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: |
+          app_path="$(find "${PRIVATE_SOURCE_PATH}/src-tauri/target/${MATRIX_TARGET}/release/bundle/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "${app_path}"
+          test -d "${app_path}/Contents/_CodeSignature"
+          codesign --verify --deep --strict --verbose=2 "${app_path}"
+          spctl --assess --type execute --verbose=2 "${app_path}"
+
+  android:
+    # 不等 verify：构建只往 release-bootstrap 预建的 Draft 上传，Draft 不公开；
+    # finalize / finalize-unsigned-release 都要求 needs.verify.result == 'success'
+    # 才会发布，verify 失败时 Draft 留着，下次运行 prepare 会清掉。
+    needs: [prepare, release-bootstrap]
+    if: needs.prepare.outputs.android_enabled == 'true'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Quiet cargo output in public logs
+        # 公开日志不打印 Compiling/Downloaded 依赖清单。这里故意不设 RUSTFLAGS：
+        # cargo-mobile2 会在生成的 .cargo/config.toml 里写 target.<triple>.rustflags
+        # （Android 的 -landroid/-llog/-lOpenSLES 链接参数），RUSTFLAGS 环境变量会
+        # 整个顶掉它们导致链接失败。编译错误和 warning 仍会打印。
+        shell: bash
+        run: echo "CARGO_TERM_QUIET=true" >> "${GITHUB_ENV}"
+
+      - name: Checkout private Tauri source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ env.PRIVATE_SOURCE_REPOSITORY }}
+          ref: ${{ needs.prepare.outputs.source_ref }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+          persist-credentials: false
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+
+      - name: Download third-party license list
+        if: needs.prepare.outputs.third_party_licenses == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: third-party-licenses
+          path: ${{ env.PRIVATE_SOURCE_PATH }}/src-tauri/licenses
+
+      - name: Check bundled third-party license list
+        if: needs.prepare.outputs.third_party_licenses == 'true'
+        shell: bash
+        run: |
+          f="${PRIVATE_SOURCE_PATH}/src-tauri/licenses/THIRD_PARTY_LICENSES.html"
+          if [[ ! -s "${f}" ]] || grep -q "fanqie-third-party-licenses-placeholder" "${f}"; then
+            echo "::error::要打进安装包的第三方许可证清单仍是占位文件。"
+            exit 1
+          fi
+          echo "第三方许可证清单已就位"
+
+      - name: Checkout release wrapper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: release-wrapper
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Require pre-created release ID
+        if: inputs.publish_release == true || inputs.publish_unsigned_prerelease == true || inputs.publish_unsigned_release == true
+        shell: bash
+        env:
+          RELEASE_ID: ${{ needs.release-bootstrap.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          # 所有上传只认 release-bootstrap 预建的那个 Draft。拿不到 ID 就直接失败，
+          # 绝不退回按 tag 查找或另建草稿（那正是附件被拆到两个同 tag 草稿的原因）。
+          if [[ ! "${RELEASE_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::release-bootstrap 没有提供预建 Draft 的 Release ID，拒绝按 tag 查找或新建草稿"
+            exit 1
+          fi
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
+        with:
+          # The legacy "tools" package in the action's defaults is no longer
+          # available. SDK platforms, build tools and NDK are installed below.
+          packages: platform-tools
+
+      - uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
+        with:
+          targets: >-
+            aarch64-linux-android,
+            armv7-linux-androideabi,
+            i686-linux-android,
+            x86_64-linux-android
+
+      # 只缓存公开依赖的编译产物：cache-workspace-crates=false 让 rust-cache 保存前清掉工作区 crate，
+      # 下面 job 末尾的 "Remove private build outputs before cache save" 再按名字兜底删一遍私有 crate；
+      # 只有 main 上的运行写缓存（fork PR 能读 main 的缓存，所以缓存里绝不能有私有源码的产物）。
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: ${{ env.PRIVATE_SOURCE_PATH }}/src-tauri -> target
+          key: android
+          cache-workspace-crates: "false"
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install Android SDK, NDK and Tauri CLI
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "ndk;${ANDROID_NDK_VERSION}"
+          # 预编译 cargo-tauri（sha256 固定）；拿不到或校验不过时脚本自动退回 cargo install。
+          bash "${GITHUB_WORKSPACE}/release-wrapper/scripts/install-cargo-tauri.sh"
+
+      - name: Configure Android version
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION_CODE: ${{ github.run_number }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          Path("src-tauri/tauri.android.release.conf.json").write_text(
+              json.dumps({"version": os.environ["APP_VERSION"]}, ensure_ascii=False),
+              encoding="utf-8",
+          )
+          PY
+          echo "FANQIE_ANDROID_VERSION_NAME=${APP_VERSION}" >> "${GITHUB_ENV}"
+          echo "FANQIE_ANDROID_VERSION_CODE=$((100000 + VERSION_CODE))" >> "${GITHUB_ENV}"
+
+      - name: Ensure Android signing (official secrets or CI-internal keystore)
+        id: signing
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          FANQIE_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          FANQIE_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          FANQIE_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          # 正式发布：缺少正式 keystore 时脚本和 Gradle 都直接失败，不退回临时 / debug keystore。
+          FANQIE_ANDROID_REQUIRE_RELEASE_SIGNING: ${{ inputs.publish_release == true && 'true' || 'false' }}
+        run: |
+          chmod +x scripts/ci-ensure-android-signing.sh
+          ./scripts/ci-ensure-android-signing.sh
+
+      - name: Require official signing for published Android release
+        if: inputs.publish_release == true && steps.signing.outputs.mode != 'release-secret'
+        run: |
+          echo "Publishing Android requires ANDROID_KEYSTORE_BASE64 and related secrets."
+          exit 1
+
+      - name: Build split APKs, universal APK and AAB
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+          FANQIE_UPDATE_CHANNEL: ${{ needs.prepare.outputs.update_channel }}
+        run: |
+          set -euo pipefail
+          # Gradle splits.abi produces three small single-ABI APKs plus a
+          # universal fallback. Remove stale outputs so collection cannot pick
+          # up a universal-only APK from an earlier build/cache.
+          rm -rf src-tauri/gen/android/app/build/outputs/apk \
+            src-tauri/gen/android/app/build/outputs/bundle
+          # cargo / Gradle 的全部输出只写 runner 本地临时文件（编译错误会带私有源码，
+          # 链接失败会打出完整依赖清单）；公开日志只有通过/失败、退出码、用时。
+          node "${GITHUB_WORKSPACE}/release-wrapper/scripts/silent-run.mjs" \
+            --name android-build \
+            -- cargo tauri android build \
+            --target aarch64 armv7 i686 x86_64 \
+            --apk \
+            --aab \
+            --ci \
+            --config src-tauri/tauri.android.release.conf.json
+          echo "=== Build outputs ==="
+          find src-tauri/gen/android/app/build/outputs -type f \( -name '*.apk' -o -name '*.aab' \) -printf '%f  %s bytes\n' | sort
+
+      - name: Collect and verify signed Android artifacts
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/ci-collect-android-artifacts.sh
+          scripts/ci-collect-android-artifacts.sh
+          for required in \
+            "dist/android/FanqieNovelDownloader-${FANQIE_ANDROID_VERSION_NAME}-android-arm64-v8a.apk" \
+            "dist/android/FanqieNovelDownloader-${FANQIE_ANDROID_VERSION_NAME}-android-armeabi-v7a.apk" \
+            "dist/android/FanqieNovelDownloader-${FANQIE_ANDROID_VERSION_NAME}-android-x86_64.apk" \
+            "dist/android/FanqieNovelDownloader-${FANQIE_ANDROID_VERSION_NAME}-android-universal.apk" \
+            "dist/android/FanqieNovelDownloader-${FANQIE_ANDROID_VERSION_NAME}-android.aab"
+          do
+            test -s "${required}"
+          done
+          echo "=== Collected Android artifacts ==="
+          find dist/android -type f -printf '%f  %s bytes\n' | sort
+          APKSIGNER="${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
+          expected_signer="${ANDROID_RELEASE_SIGNER_SHA256,,}"
+          if [[ ! "${expected_signer}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::ANDROID_RELEASE_SIGNER_SHA256 不是 64 位十六进制指纹" >&2
+            exit 1
+          fi
+          while IFS= read -r apk; do
+            echo "Verifying signature: ${apk}"
+            certs="$("${APKSIGNER}" verify --verbose --print-certs "$apk")"
+            printf '%s\n' "${certs}"
+            # 正式 keystore 签出的包必须且只能带固定的发布证书；CI 临时 keystore
+            # 每次运行证书都不同，只给警告（发布正式版时上一步已经拒绝这种模式）。
+            mapfile -t signers < <(
+              printf '%s\n' "${certs}" \
+                | sed -n -E 's/^Signer #[0-9]+ certificate SHA-256 digest: ([0-9a-fA-F]+)$/\1/p' \
+                | tr 'A-F' 'a-f' | sort -u
+            )
+            if [[ "${FANQIE_ANDROID_SIGNING_MODE}" == "release-secret" ]]; then
+              if [[ "${#signers[@]}" -ne 1 || "${signers[0]}" != "${expected_signer}" ]]; then
+                echo "::error::${apk##*/} 的签名证书与固定的发布证书不一致（期望 ${expected_signer}，实际 ${signers[*]:-无}）。请检查 ANDROID_KEYSTORE_* Secrets。" >&2
+                exit 1
+              fi
+            else
+              echo "::warning::${apk##*/} 使用 CI 临时证书签名（${signers[*]:-无}），无法覆盖安装正式版。"
+            fi
+          done < <(find dist/android -type f -name '*.apk' | sort)
+          {
+            echo "signing_mode=${FANQIE_ANDROID_SIGNING_MODE}"
+            echo "verified_with=apksigner"
+            if [[ "${FANQIE_ANDROID_SIGNING_MODE}" == "release-secret" ]]; then
+              echo "signer_sha256=${expected_signer}"
+            fi
+            echo "installable=true"
+          } > dist/android/SIGNING.txt
+          sha256sum dist/android/* > dist/android/SHA256SUMS-android.txt
+
+      # Android 15+ 的 16 KiB 页设备要求 64 位 .so 的 LOAD 段与 APK 内存放都按 16 KiB 对齐。
+      # 先以 warning 观察一两个版本，确认全部通过后再加 --strict 改为阻断发布。
+      - name: Check Android 16 KiB page alignment
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t apks < <(find dist/android -type f -name '*.apk' | sort)
+          python "${GITHUB_WORKSPACE}/release-wrapper/scripts/check-android-16k-alignment.py" "${apks[@]}"
+
+      - name: Upload Android release assets
+        if: inputs.publish_release == true || inputs.publish_unsigned_prerelease == true || inputs.publish_unsigned_release == true
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          RELEASE_ID: ${{ needs.release-bootstrap.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          python "${GITHUB_WORKSPACE}/release-wrapper/scripts/release-assets.py" upload \
+            --repo "${GH_REPO}" \
+            --release-id "${RELEASE_ID}" \
+            --tag "${TAG_NAME}" \
+            dist/android/*
+
+      - name: Remove private build outputs before cache save
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${PRIVATE_SOURCE_PATH}/src-tauri/target"
+          [[ -d "${target}" ]] || exit 0
+          # 私有 crate 的编译产物、增量编译数据和打包目录都不进缓存。
+          find "${target}" -type d \( -name 'incremental' -o -name 'bundle' \) -prune -exec rm -rf {} + 2>/dev/null || true
+          find "${target}" \( -name '*fanqie*' -o -name '*account_auth*' -o -name '*account-auth*' \) -prune -exec rm -rf {} + 2>/dev/null || true
+          if find "${target}" \( -name '*fanqie*' -o -name '*account_auth*' -o -name '*account-auth*' \) -print -quit | grep -q .; then
+            # 删不干净就整个 target 都不缓存，宁可这次没有缓存也不让私有产物进缓存。
+            echo "::warning::target 里还有私有 crate 的产物，这次不缓存 target。"
+            rm -rf "${target}"
+          fi
+
+  ios:
+    # 不等 verify：构建只往 release-bootstrap 预建的 Draft 上传，Draft 不公开；
+    # finalize / finalize-unsigned-release 都要求 needs.verify.result == 'success'
+    # 才会发布，verify 失败时 Draft 留着，下次运行 prepare 会清掉。
+    needs: [prepare, release-bootstrap]
+    if: needs.prepare.outputs.ios_enabled == 'true'
+    # macos-15 still ships Xcode 16.x; Xcode 26 breaks Tauri iOS via SwiftUICore.
+    permissions:
+      contents: write
+    runs-on: macos-15
+    continue-on-error: true
+    steps:
+      - name: Quiet cargo output in public logs
+        # 公开日志不打印 Compiling/Downloaded 依赖清单。这里故意不设 RUSTFLAGS：
+        # cargo-mobile2 会在生成的 .cargo/config.toml 里写 target.<triple>.rustflags
+        # （Android 的 -landroid/-llog/-lOpenSLES 链接参数），RUSTFLAGS 环境变量会
+        # 整个顶掉它们导致链接失败。编译错误和 warning 仍会打印。
+        shell: bash
+        run: echo "CARGO_TERM_QUIET=true" >> "${GITHUB_ENV}"
+
+      - name: Checkout private Tauri source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ env.PRIVATE_SOURCE_REPOSITORY }}
+          ref: ${{ needs.prepare.outputs.source_ref }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+          persist-credentials: false
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+
+      - name: Download third-party license list
+        if: needs.prepare.outputs.third_party_licenses == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: third-party-licenses
+          path: ${{ env.PRIVATE_SOURCE_PATH }}/src-tauri/licenses
+
+      - name: Check bundled third-party license list
+        if: needs.prepare.outputs.third_party_licenses == 'true'
+        shell: bash
+        run: |
+          f="${PRIVATE_SOURCE_PATH}/src-tauri/licenses/THIRD_PARTY_LICENSES.html"
+          if [[ ! -s "${f}" ]] || grep -q "fanqie-third-party-licenses-placeholder" "${f}"; then
+            echo "::error::要打进安装包的第三方许可证清单仍是占位文件。"
+            exit 1
+          fi
+          echo "第三方许可证清单已就位"
+
+      - name: Checkout release wrapper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: release-wrapper
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Require pre-created release ID
+        if: inputs.publish_release == true || inputs.publish_unsigned_prerelease == true || inputs.publish_unsigned_release == true
+        shell: bash
+        env:
+          RELEASE_ID: ${{ needs.release-bootstrap.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          # 所有上传只认 release-bootstrap 预建的那个 Draft。拿不到 ID 就直接失败，
+          # 绝不退回按 tag 查找或另建草稿（那正是附件被拆到两个同 tag 草稿的原因）。
+          if [[ ! "${RELEASE_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::release-bootstrap 没有提供预建 Draft 的 Release ID，拒绝按 tag 查找或新建草稿"
+            exit 1
+          fi
+
+      - name: Select Xcode 16 (avoid SwiftUICore link error on Xcode 26)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Available Xcode apps:"
+          for available in /Applications/Xcode*.app; do
+            [[ -e "${available}" ]] && echo "${available##*/}"
+          done
+          selected=""
+          for app in \
+            /Applications/Xcode_16.4.app \
+            /Applications/Xcode_16.3.app \
+            /Applications/Xcode_16.2.app \
+            /Applications/Xcode_16.1.app \
+            /Applications/Xcode_16.0.app \
+            /Applications/Xcode_16.app
+          do
+            if [[ -d "$app" ]]; then
+              selected="$app"
+              break
+            fi
+          done
+          if [[ -z "${selected}" ]]; then
+            echo "No Xcode 16.x found on runner; iOS build cannot proceed safely on Xcode 26."
+            exit 1
+          fi
+          sudo xcode-select -s "${selected}/Contents/Developer"
+          sudo xcodebuild -license accept || true
+          xcodebuild -version
+          xcrun --show-sdk-path --sdk iphoneos
+
+      - uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      # 只缓存公开依赖的编译产物：cache-workspace-crates=false 让 rust-cache 保存前清掉工作区 crate，
+      # 下面 job 末尾的 "Remove private build outputs before cache save" 再按名字兜底删一遍私有 crate；
+      # 只有 main 上的运行写缓存（fork PR 能读 main 的缓存，所以缓存里绝不能有私有源码的产物）。
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: ${{ env.PRIVATE_SOURCE_PATH }}/src-tauri -> target
+          key: ios
+          cache-workspace-crates: "false"
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install XcodeGen and Tauri CLI
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          # 预编译 cargo-tauri（sha256 固定）；拿不到或校验不过时脚本自动退回 cargo install。
+          bash "${GITHUB_WORKSPACE}/release-wrapper/scripts/install-cargo-tauri.sh"
+
+      - name: Configure and validate iOS project
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          Path("src-tauri/tauri.ios.release.conf.json").write_text(
+              json.dumps({"version": os.environ["APP_VERSION"]}, ensure_ascii=False),
+              encoding="utf-8",
+          )
+          PY
+          plutil -lint src-tauri/gen/apple/fanqie-novel-downloader-tauri_iOS/Info.plist
+          /usr/libexec/PlistBuddy \
+            -c "Print :UIFileSharingEnabled" \
+            src-tauri/gen/apple/fanqie-novel-downloader-tauri_iOS/Info.plist
+          grep -q "fanqie_present_file_share_sheet" \
+            src-tauri/src/ios_file_share.mm
+          grep -q "ios_file_share.mm" src-tauri/build.rs
+
+      - name: Build unsigned iOS IPA
+        if: inputs.publish_unsigned_prerelease == true || inputs.publish_unsigned_release == true || needs.prepare.outputs.ios_signing != 'true'
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        env:
+          FANQIE_UPDATE_CHANNEL: ${{ needs.prepare.outputs.update_channel }}
+        # cargo / Xcode 的全部输出只写 runner 本地临时文件；公开日志只有通过/失败。
+        run: >-
+          node "${GITHUB_WORKSPACE}/release-wrapper/scripts/silent-run.mjs"
+          --name ios-build-unsigned
+          -- cargo tauri ios build
+          --target aarch64
+          --ci
+          --no-sign
+          --config src-tauri/tauri.ios.release.conf.json
+
+      - name: Build signed App Store IPA
+        if: inputs.publish_unsigned_prerelease == false && inputs.publish_unsigned_release == false && needs.prepare.outputs.ios_signing == 'true'
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        env:
+          FANQIE_UPDATE_CHANNEL: ${{ needs.prepare.outputs.update_channel }}
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
+          APPLE_DEVELOPMENT_TEAM: ${{ secrets.APPLE_DEVELOPMENT_TEAM }}
+        # cargo / Xcode 的全部输出只写 runner 本地临时文件；公开日志只有通过/失败。
+        run: >-
+          node "${GITHUB_WORKSPACE}/release-wrapper/scripts/silent-run.mjs"
+          --name ios-build-app-store
+          -- cargo tauri ios build
+          --target aarch64
+          --ci
+          --export-method app-store-connect
+          --config src-tauri/tauri.ios.release.conf.json
+
+      - name: Collect iOS IPA
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p dist/ios
+          while IFS= read -r file; do
+            cp "$file" "dist/ios/FanqieNovelDownloader-${RELEASE_VERSION}-$(basename "$file")"
+          done < <(find src-tauri/gen/apple -type f -name '*.ipa' | sort)
+          test -n "$(find dist/ios -type f -name '*.ipa' -print -quit)"
+          shasum -a 256 dist/ios/*.ipa > dist/ios/SHA256SUMS-ios.txt
+
+      - name: Upload iOS release assets
+        if: inputs.publish_release == true || inputs.publish_unsigned_prerelease == true || inputs.publish_unsigned_release == true
+        working-directory: ${{ env.PRIVATE_SOURCE_PATH }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          RELEASE_ID: ${{ needs.release-bootstrap.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          python "${GITHUB_WORKSPACE}/release-wrapper/scripts/release-assets.py" upload \
+            --repo "${GH_REPO}" \
+            --release-id "${RELEASE_ID}" \
+            --tag "${TAG_NAME}" \
+            dist/ios/*
+
+      - name: Remove private build outputs before cache save
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${PRIVATE_SOURCE_PATH}/src-tauri/target"
+          [[ -d "${target}" ]] || exit 0
+          # 私有 crate 的编译产物、增量编译数据和打包目录都不进缓存。
+          find "${target}" -type d \( -name 'incremental' -o -name 'bundle' \) -prune -exec rm -rf {} + 2>/dev/null || true
+          find "${target}" \( -name '*fanqie*' -o -name '*account_auth*' -o -name '*account-auth*' \) -prune -exec rm -rf {} + 2>/dev/null || true
+          if find "${target}" \( -name '*fanqie*' -o -name '*account_auth*' -o -name '*account-auth*' \) -print -quit | grep -q .; then
+            # 删不干净就整个 target 都不缓存，宁可这次没有缓存也不让私有产物进缓存。
+            echo "::warning::target 里还有私有 crate 的产物，这次不缓存 target。"
+            rm -rf "${target}"
+          fi
+
+  finalize:
+    needs: [prepare, verify, release-bootstrap, desktop, desktop-fallback, android, ios]
+    if: >-
+      always() &&
+      inputs.publish_release == true &&
+      needs.prepare.outputs.unsigned_mode != 'true' &&
+      needs.prepare.result == 'success' &&
+      needs.verify.result == 'success' &&
+      needs.release-bootstrap.result == 'success' &&
+      (needs.desktop.result == 'success' || needs.desktop.result == 'skipped') &&
+      (needs.desktop-fallback.result == 'success' || needs.desktop-fallback.result == 'skipped') &&
+      (needs.android.result == 'success' || needs.android.result == 'skipped') &&
+      (needs.ios.result == 'success' || needs.ios.result == 'skipped' || needs.ios.result == 'failure')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release wrapper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Finalize and publish draft release
+        shell: bash
+        env:
+          FANQIE_VERIFY_SUMMARY: ${{ needs.verify.outputs.summary }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          RELEASE_ID: ${{ needs.release-bootstrap.outputs.release_id }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_REF: ${{ needs.prepare.outputs.source_ref }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          PLATFORMS: ${{ needs.prepare.outputs.selected_platforms }}
+          RELEASE_HIGHLIGHTS: ${{ inputs.release_highlights }}
+        run: |
+          set -euo pipefail
+          arguments=(
+            --repo "${GH_REPO}"
+            --tag "${TAG_NAME}"
+            --release-id "${RELEASE_ID}"
+            --version "${VERSION}"
+            --source-ref "${SOURCE_REF}"
+            --source-commit "${SOURCE_COMMIT}"
+            --platforms "${PLATFORMS}"
+          )
+          if [[ -n "${RELEASE_HIGHLIGHTS//[[:space:]]/}" ]]; then
+            printf '%s\n' "${RELEASE_HIGHLIGHTS}" > release-highlights.md
+            arguments+=(--highlights-file release-highlights.md)
+          fi
+          python scripts/finalize-release.py "${arguments[@]}"
+
+      - name: Release summary
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag_name }}
+          SOURCE_COMMIT_SHORT: ${{ needs.prepare.outputs.source_commit }}
+          SELECTED_PLATFORMS: ${{ needs.prepare.outputs.selected_platforms }}
+          IS_PRERELEASE: ${{ inputs.prerelease }}
+          HAS_UPDATER_METADATA: ${{ needs.prepare.outputs.desktop_count != '0' }}
+          DESKTOP_FALLBACK_COUNT: ${{ needs.prepare.outputs.desktop_fallback_count }}
+          DESKTOP_RESULT: ${{ needs.desktop.result }}
+          DESKTOP_FALLBACK_RESULT: ${{ needs.desktop-fallback.result }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Tauri Release
+
+          - Version: \`${RELEASE_VERSION}\`
+          - Tag: \`${RELEASE_TAG}\`
+          - Private source: \`${PRIVATE_SOURCE_REPOSITORY}@${SOURCE_COMMIT_SHORT}\`
+          - Platforms: ${SELECTED_PLATFORMS}
+          - Prerelease: \`${IS_PRERELEASE}\`
+          - Updater metadata: \`${HAS_UPDATER_METADATA}\`
+          - Desktop fallback jobs: \`${DESKTOP_FALLBACK_COUNT}\`
+          - Desktop native result: \`${DESKTOP_RESULT}\`
+          - Desktop fallback result: \`${DESKTOP_FALLBACK_RESULT}\`
+          EOF
+
+  # 无签名发布是在原有签名 finalizer 之外追加的独立收尾器。它拥有独立
+  # 的脚本、清单、说明区块和更新通道，不能复用或覆盖 finalize job。
+  finalize-unsigned-release:
+    needs: [prepare, verify, release-bootstrap, desktop, desktop-fallback, android, ios]
+    if: >-
+      always() &&
+      (inputs.publish_unsigned_prerelease == true || inputs.publish_unsigned_release == true) &&
+      needs.prepare.result == 'success' &&
+      needs.verify.result == 'success' &&
+      needs.release-bootstrap.result == 'success' &&
+      (needs.desktop.result == 'success' || needs.desktop.result == 'skipped') &&
+      (needs.desktop-fallback.result == 'success' || needs.desktop-fallback.result == 'skipped') &&
+      (needs.android.result == 'success' || needs.android.result == 'skipped') &&
+      (needs.ios.result == 'success' || needs.ios.result == 'skipped' || needs.ios.result == 'failure')
+    permissions:
+      contents: write
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout release wrapper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Ensure stable updater channel
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python scripts/publish-stable-channel.py \
+            --repo "${GH_REPO}" \
+            --work-dir "${RUNNER_TEMP}/stable-channel-check"
+
+      - name: Finalize and publish unsigned release
+        shell: bash
+        env:
+          FANQIE_VERIFY_SUMMARY: ${{ needs.verify.outputs.summary }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          RELEASE_ID: ${{ needs.release-bootstrap.outputs.release_id }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_REF: ${{ needs.prepare.outputs.source_ref }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          PLATFORMS: ${{ needs.prepare.outputs.selected_platforms }}
+          RELEASE_HIGHLIGHTS: ${{ inputs.release_highlights }}
+          UNSIGNED_PRERELEASE: ${{ inputs.publish_unsigned_prerelease }}
+        run: |
+          set -euo pipefail
+          mode=formal
+          if [[ "${UNSIGNED_PRERELEASE}" == "true" ]]; then
+            mode=prerelease
+          fi
+          arguments=(
+            --repo "${GH_REPO}"
+            --tag "${TAG_NAME}"
+            --release-id "${RELEASE_ID}"
+            --mode "${mode}"
+            --version "${VERSION}"
+            --source-ref "${SOURCE_REF}"
+            --source-commit "${SOURCE_COMMIT}"
+            --platforms "${PLATFORMS}"
+          )
+          if [[ -n "${RELEASE_HIGHLIGHTS//[[:space:]]/}" ]]; then
+            printf '%s\n' "${RELEASE_HIGHLIGHTS}" > release-highlights.md
+            arguments+=(--highlights-file release-highlights.md)
+          fi
+          python scripts/finalize-unsigned-release.py "${arguments[@]}"
+
+      - name: Verify published device guide and unsigned updater channel
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          RELEASE_ID: ${{ needs.release-bootstrap.outputs.release_id }}
+          PLATFORMS: ${{ needs.prepare.outputs.selected_platforms }}
+          UNSIGNED_PRERELEASE: ${{ inputs.publish_unsigned_prerelease }}
+          CREATE_UPDATER_ARTIFACTS: ${{ needs.prepare.outputs.create_updater_artifacts }}
+        run: |
+          set -euo pipefail
+          release_json="${RUNNER_TEMP}/published-unsigned-release.json"
+          gh api "repos/${GH_REPO}/releases/${RELEASE_ID}" > "${release_json}"
+          test "$(jq -r .tag_name "${release_json}")" = "${TAG_NAME}"
+          python - "${release_json}" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          release = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if release.get("draft") is not False:
+              raise SystemExit("无签名 Release 仍是 Draft")
+          body = str(release.get("body") or "")
+          required = [
+              "<!-- fanqie:unsigned-finalizer:start -->",
+              "<!-- fanqie:unsigned-finalizer:end -->",
+              "## 平台状态与安装限制",
+              "## 下载地址",
+              "### 🪟 Windows", "### 🍎 macOS", "### 🐧 Linux",
+              "### 🤖 Android", "### 📱 iOS",
+              "SHA-256 完整清单",
+              "### ❓ 常见问题", "### 💎 支持与推广",
+              "### 🔗 相关链接", "<summary>📦 构建信息</summary>",
+          ]
+          if body.count(required[0]) != 1 or body.count(required[1]) != 1:
+              raise SystemExit("已发布无签名 finalizer 托管区块数量不正确")
+          if body.count("## 下载地址") != 1:
+              raise SystemExit("已发布无签名 Release 下载区数量不正确")
+          forbidden = (
+              "<!-- fanqie:unsigned-draft:start -->",
+              "<!-- fanqie:unsigned-draft:end -->",
+              "> ⏳ **本版本正在构建中**。",
+              "## 下载地址（默认：最新已发布版本）",
+          )
+          present = [value for value in forbidden if value in body]
+          if present:
+              raise SystemExit("已发布正文仍含 Draft 内容：" + ", ".join(present))
+          selected = {
+              value.strip().lower()
+              for value in os.environ.get("PLATFORMS", "").split(",")
+              if value.strip()
+          }
+          platform_requirements = {
+              "windows-x64": ("64位（常用）", "windows-x64-portable.exe"),
+              "windows-arm64": ("ARM64（Surface / 骁龙本）", "windows-arm64-portable.exe"),
+              "linux-x64": ("linux-amd64.deb", "amd64.AppImage"),
+              "linux-arm64": ("linux-arm64.deb",),
+              "macos-x64": ("Intel 芯片", "darwin-x64.dmg", "darwin-x64.zip"),
+              "macos-arm64": ("Apple M 芯片", "darwin-aarch64.dmg", "darwin-aarch64.zip"),
+              "android": (
+                  "64位 arm64-v8a", "32位 armeabi-v7a",
+                  "通用版 universal", "x86_64（模拟器 / 部分平板）",
+              ),
+              "ios": ("无签名 IPA（需自行侧载）",),
+          }
+          for platform in selected:
+              if platform not in platform_requirements:
+                  raise SystemExit("发布后检查遇到未知平台：" + platform)
+              required.extend(platform_requirements[platform])
+          missing = [value for value in required if value not in body]
+          if "linux-arm64" in selected and not any(
+              value in body
+              for value in ("arm64.AppImage", "aarch64.AppImage")
+          ):
+              missing.append("Linux ARM64 AppImage")
+          if missing:
+              raise SystemExit("已发布设备指引缺项：" + ", ".join(missing))
+          if os.environ.get("UNSIGNED_PRERELEASE", "false") != "true" and "unsigned/latest.json" not in body:
+              raise SystemExit("正式无签名 Release 缺少 unsigned/latest.json 通道说明")
+          PY
+          if [[ "${UNSIGNED_PRERELEASE}" != "true" && "${CREATE_UPDATER_ARTIFACTS}" == "true" ]]; then
+            curl --fail --location --silent --show-error \
+              --output "${RUNNER_TEMP}/unsigned-latest.json" \
+              "https://github.com/${GH_REPO}/releases/download/unsigned/latest.json"
+            python - "${RUNNER_TEMP}/unsigned-latest.json" "${TAG_NAME}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          source_tag = sys.argv[2]
+          entries = metadata.get("platforms")
+          if not isinstance(entries, dict) or not entries:
+              raise SystemExit("unsigned/latest.json 没有平台条目")
+          if any(
+              f"/download/{source_tag}/" not in str(entry.get("url") or "")
+              or not str(entry.get("signature") or "").strip()
+              for entry in entries.values()
+          ):
+              raise SystemExit("unsigned/latest.json 未完整指向本次无签名 Release")
+          PY
+          fi
+
+  # 独立 macOS 未签名通道：行为与原 publish-unsigned-macos.yml 一致——
+  # ad-hoc 签名、不产出 updater 元数据、不需要 TAURI 签名密钥、
+  # 使用自己的 macos-unsigned-v* 预发布，且不改变稳定版。
+  macos-unsigned-bootstrap:
+    needs: [prepare, verify]
+    if: inputs.macos_unsigned_channel == true
+    permissions:
+      contents: write
+    runs-on: ubuntu-22.04
+    outputs:
+      stable_tag: ${{ steps.release.outputs.stable_tag }}
+      release_id: ${{ steps.release-id.outputs.release_id }}
+    steps:
+      - name: Checkout release wrapper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Create unsigned macOS draft prerelease
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit_full }}
+          SOURCE_REF: ${{ needs.prepare.outputs.source_ref }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          # sed 正则中的行尾锚点是字面量，不需要 shell 展开。
+          # shellcheck disable=SC2016
+          stable_tag="$(gh api "repos/${GH_REPO}/releases/tags/stable" --jq '.body' | sed -n 's/^- 稳定源 Release：`\([^`]*\)`.*/\1/p' | head -n 1)"
+          test -n "${stable_tag}"
+          echo "stable_tag=${stable_tag}" >> "${GITHUB_OUTPUT}"
+          # The heredoc is Markdown; Chinese typographic quotes are intentional.
+          # shellcheck disable=SC1111
+          cat > release-notes.md <<EOF
+          ## macOS 未签名客户端 ${VERSION}
+
+          这是独立的 **unsigned prerelease**，用于在 Apple Developer ID 签名和公证尚未配置时优先向 macOS 用户提供客户端。它不会替代稳定版，也不会写入桌面自动更新的 \`latest.json\`。
+
+          > 本版本只做了 ad-hoc 代码签名，未经过 Apple Developer ID 签名或公证。macOS 首次打开时会显示 Gatekeeper 提示，这是预期行为；构建完成后请先核对本页 SHA-256 清单。
+
+          构建正在进行，完成后本页会列出 Apple Silicon 与 Intel 的 DMG、APP ZIP 及校验值。
+
+          ### 安装
+
+          1. 优先打开 DMG，将应用拖入“应用程序”。
+          2. 本包只做了 ad-hoc 签名、未经 Apple 公证，首次启动会被拦截。前往“系统设置 → 隐私与安全性”，在被拦截的提示处选择“仍要打开”。
+          3. 若系统仍提示“已损坏”或没有出现“仍要打开”，在核对 SHA-256 后对该应用单独执行：
+
+          \`\`\`bash
+          xattr -dr com.apple.quarantine "/Applications/Fanqie Novel Downloader.app"
+          \`\`\`
+
+          不需要、也不应全局关闭 Gatekeeper。
+
+          ### 其他平台状态
+
+          本预发布只提供 macOS 客户端；其他平台请从[稳定版 Release](https://github.com/${GH_REPO}/releases/tag/${stable_tag})获取：
+
+          - Windows 当前未配置 Authenticode 证书，SmartScreen 或“无法验证发行商”提示属于预期，核对 SHA-256 后可在文件属性中解除锁定。
+          - Linux 的 DEB / AppImage 不提供项目级发行商签名，请按架构选择并核对 SHA-256；AppImage 需要执行权限。
+          - Android 正式 APK / AAB 使用发布密钥并经 \`apksigner\` 验证；安装 APK 仍需允许未知来源。
+          - iOS IPA 当前为无 Apple 签名侧载包，不支持 App Store。
+          - 本预发布不进入稳定版自动更新；未签名或无 updater 签名的包请手动安装。
+
+          ### 构建信息
+
+          - 私有源码引用：\`${SOURCE_REF}\`
+          - 私有源码提交：\`${SOURCE_COMMIT}\`
+          - 稳定版保持为：\`${stable_tag}\`
+          EOF
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            is_prerelease="$(gh release view "${TAG_NAME}" --json isPrerelease --jq .isPrerelease)"
+            if [[ "${is_prerelease}" != "true" ]]; then
+              echo "Refusing to reuse a non-prerelease tag: ${TAG_NAME}"
+              exit 1
+            fi
+            gh release edit "${TAG_NAME}" \
+              --title "番茄小说下载器 macOS 未签名版 ${VERSION}" \
+              --notes-file release-notes.md \
+              --prerelease
+          else
+            gh release create "${TAG_NAME}" \
+              --title "番茄小说下载器 macOS 未签名版 ${VERSION}" \
+              --notes-file release-notes.md \
+              --target "${GITHUB_SHA}" \
+              --draft \
+              --prerelease
+          fi
+
+      - name: Resolve draft release ID
+        id: release-id
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          python scripts/release-assets.py resolve \
+            --repo "${GH_REPO}" \
+            --tag "${TAG_NAME}" \
+            --require-draft \
+            --github-output "${GITHUB_OUTPUT}"
+
+  macos-unsigned-build:
+    needs: [prepare, verify, macos-unsigned-bootstrap]
+    if: inputs.macos_unsigned_channel == true
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.macos_unsigned_matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    name: Build unsigned macOS ${{ matrix.arch }}
+    steps:
+      - name: Quiet cargo / rustc output in public logs
+        # 公开日志不打印 rustc warning（会带源码片段）和 Compiling/Downloaded
+        # 依赖清单。RUSTFLAGS 是在已有值后追加，不覆盖；编译错误仍会打印。
+        shell: bash
+        run: |
+          {
+            echo "RUSTFLAGS=${RUSTFLAGS:+${RUSTFLAGS} }-Awarnings"
+            echo "CARGO_TERM_QUIET=true"
+          } >> "${GITHUB_ENV}"
+
+      - name: Checkout private Tauri source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ env.PRIVATE_SOURCE_REPOSITORY }}
+          ref: ${{ needs.prepare.outputs.source_commit_full }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+          persist-credentials: false
+          path: ${{ env.PRIVATE_SOURCE_PATH }}
+          fetch-depth: 1
+
+      - name: Download third-party license list
+        if: needs.prepare.outputs.third_party_licenses == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: third-party-licenses
+          path: ${{ env.PRIVATE_SOURCE_PATH }}/src-tauri/licenses
+
+      - name: Check bundled third-party license list
+        if: needs.prepare.outputs.third_party_licenses == 'true'
+        shell: bash
+        run: |
+          f="${PRIVATE_SOURCE_PATH}/src-tauri/licenses/THIRD_PARTY_LICENSES.html"
+          if [[ ! -s "${f}" ]] || grep -q "fanqie-third-party-licenses-placeholder" "${f}"; then
+            echo "::error::要打进安装包的第三方许可证清单仍是占位文件。"
+            exit 1
+          fi
+          echo "第三方许可证清单已就位"
+
+      - name: Checkout release wrapper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: release-wrapper
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Validate macOS app icon
+        shell: bash
+        run: |
+          set -euo pipefail
+          icon="${PRIVATE_SOURCE_PATH}/src-tauri/icons/icon.icns"
+          iconset="${RUNNER_TEMP}/fanqie-app-icon.iconset"
+          rm -rf "${iconset}"
+          iconutil -c iconset "${icon}" -o "${iconset}"
+          test -f "${iconset}/icon_512x512@2x.png"
+
+      - uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Create unsigned release build config
+        shell: python
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          import json
+          import os
+          from pathlib import Path
+
+          # 没有 Developer ID 时仍必须做 ad-hoc 签名（signingIdentity "-"）。
+          # 完全没有 bundle 签名封印的 .app 带着 com.apple.quarantine 打开时，
+          # Gatekeeper 会直接报“已损坏，无法打开”，且不提供“仍要打开”入口。
+          identity = "-"
+          path = Path(os.environ["PRIVATE_SOURCE_PATH"]) / "src-tauri" / "tauri.release.conf.json"
+          path.write_text(
+              json.dumps({
+                  "version": os.environ["APP_VERSION"],
+                  "bundle": {
+                      "createUpdaterArtifacts": False,
+                      "macOS": {"signingIdentity": identity},
+                  },
+              }, ensure_ascii=False),
+              encoding="utf-8",
+          )
+
+      - name: Build unsigned macOS bundles
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: ${{ env.PRIVATE_SOURCE_PATH }}
+          # 构建输出（编译错误、链接命令、打包日志）只写 runner 本地临时文件，公开日志
+          # 只有通过/失败、退出码、用时；失败时提示去私有仓库本地复现。
+          tauriScript: node ${{ github.workspace }}/release-wrapper/scripts/silent-run.mjs --tauri
+          retryAttempts: 5
+          args: >-
+            --target ${{ matrix.target }}
+            --bundles app,dmg
+            --config src-tauri/tauri.release.conf.json
+          uploadWorkflowArtifacts: false
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: false
+          tagName: ""
+
+      - name: Verify and package unsigned client
+        shell: bash
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+          ASSET_ARCH: ${{ matrix.arch }}
+          MACHO_ARCH: ${{ matrix.macho_arch }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bundle_root="${PRIVATE_SOURCE_PATH}/src-tauri/target/${TARGET}/release/bundle"
+          app_path="$(find "${bundle_root}/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          dmg_path="$(find "${bundle_root}/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          test -n "${app_path}"
+          test -n "${dmg_path}"
+          test -f "${app_path}/Contents/Info.plist"
+          test -f "${app_path}/Contents/Resources/icon.icns"
+          test -d "${app_path}/Contents/_CodeSignature"
+          codesign --verify --deep --strict --verbose=2 "${app_path}"
+          codesign -dvv "${app_path}" 2>&1 | grep -Fqx "Signature=adhoc"
+
+          bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${app_path}/Contents/Info.plist")"
+          bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${app_path}/Contents/Info.plist")"
+          executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${app_path}/Contents/Info.plist")"
+          executable="${app_path}/Contents/MacOS/${executable_name}"
+          test "${bundle_id}" = "com.pofl.fanqienoveldownloader"
+          test "${bundle_version}" = "${APP_VERSION}"
+          file "${executable}" | grep -F "${MACHO_ARCH}"
+          hdiutil verify "${dmg_path}"
+
+          mount_dir="${RUNNER_TEMP}/fanqie-dmg-${ASSET_ARCH}"
+          runtime_dir="${RUNNER_TEMP}/fanqie-runtime-${ASSET_ARCH}"
+          runtime_app="${runtime_dir}/Fanqie Novel Downloader.app"
+          runtime_log="${RUNNER_TEMP}/fanqie-runtime-${ASSET_ARCH}.log"
+          mkdir -p "${mount_dir}" "${runtime_dir}"
+          mounted=false
+          runtime_pid=""
+          cleanup() {
+            if [[ -n "${runtime_pid}" ]] && kill -0 "${runtime_pid}" 2>/dev/null; then
+              kill -TERM "${runtime_pid}" 2>/dev/null || true
+              wait "${runtime_pid}" 2>/dev/null || true
+            fi
+            if [[ "${mounted}" == "true" ]]; then
+              hdiutil detach "${mount_dir}" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
+          hdiutil attach -readonly -nobrowse -mountpoint "${mount_dir}" "${dmg_path}" >/dev/null
+          mounted=true
+          mounted_app="$(find "${mount_dir}" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "${mounted_app}"
+          ditto "${mounted_app}" "${runtime_app}"
+          hdiutil detach "${mount_dir}" >/dev/null
+          mounted=false
+
+          runtime_executable="${runtime_app}/Contents/MacOS/${executable_name}"
+          "${runtime_executable}" >"${runtime_log}" 2>&1 &
+          runtime_pid=$!
+          for _ in {1..15}; do
+            sleep 1
+            if ! kill -0 "${runtime_pid}" 2>/dev/null; then
+              wait "${runtime_pid}" || status=$?
+              cat "${runtime_log}"
+              echo "The packaged macOS app exited during startup (status ${status:-0})."
+              exit 1
+            fi
+          done
+          if grep -Eiq 'panicked at|fatal error|segmentation fault' "${runtime_log}"; then
+            cat "${runtime_log}"
+            echo "The packaged macOS app logged a fatal startup error."
+            exit 1
+          fi
+          kill -TERM "${runtime_pid}"
+          wait "${runtime_pid}" 2>/dev/null || true
+          runtime_pid=""
+
+          output="${RUNNER_TEMP}/unsigned-macos-${ASSET_ARCH}"
+          mkdir -p "${output}"
+          dmg_asset="${output}/FanqieNovelDownloader-macos-${ASSET_ARCH}-unsigned.dmg"
+          zip_asset="${output}/FanqieNovelDownloader-macos-${ASSET_ARCH}-unsigned.zip"
+          cp "${dmg_path}" "${dmg_asset}"
+          ditto -c -k --sequesterRsrc --keepParent "${app_path}" "${zip_asset}"
+          shasum -a 256 "${dmg_asset}" "${zip_asset}"
+
+      - name: Upload unsigned macOS bundles
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-macos-${{ matrix.arch }}
+          path: ${{ runner.temp }}/unsigned-macos-${{ matrix.arch }}/*
+          if-no-files-found: error
+          retention-days: 7
+
+  macos-unsigned-publish:
+    needs: [prepare, verify, macos-unsigned-bootstrap, macos-unsigned-build]
+    if: inputs.macos_unsigned_channel == true
+    permissions:
+      contents: write
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout release wrapper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: release-wrapper
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - name: Download unsigned macOS bundles
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: unsigned-macos-*
+          path: dist
+          merge-multiple: true
+
+      - name: Validate assets and create SHA-256 manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          expected=(
+            FanqieNovelDownloader-macos-arm64-unsigned.dmg
+            FanqieNovelDownloader-macos-arm64-unsigned.zip
+            FanqieNovelDownloader-macos-x64-unsigned.dmg
+            FanqieNovelDownloader-macos-x64-unsigned.zip
+          )
+          mapfile -t actual < <(find . -maxdepth 1 -type f -printf '%f\n' | sort)
+          mapfile -t wanted < <(printf '%s\n' "${expected[@]}" | sort)
+          diff -u <(printf '%s\n' "${wanted[@]}") <(printf '%s\n' "${actual[@]}")
+          sha256sum "${expected[@]}" > SHA256SUMS-macos-unsigned.txt
+          sha256sum --check SHA256SUMS-macos-unsigned.txt
+
+      - name: Upload and publish unsigned macOS prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit_full }}
+          SOURCE_REF: ${{ needs.prepare.outputs.source_ref }}
+          STABLE_TAG: ${{ needs.macos-unsigned-bootstrap.outputs.stable_tag }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          RELEASE_ID: ${{ needs.macos-unsigned-bootstrap.outputs.release_id }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/${GH_REPO}/releases/download/${TAG_NAME}"
+          # The heredoc is Markdown; Chinese typographic quotes are intentional.
+          # shellcheck disable=SC1111
+          cat > release-notes.md <<EOF
+          ## macOS 未签名客户端 ${VERSION}
+
+          这是独立的 **unsigned prerelease**。它未经过 Apple Developer ID 签名或公证，不会替代稳定版，也不会进入桌面自动更新通道。
+
+          ### 下载
+
+          - Apple Silicon（M1/M2/M3/M4 等）：[DMG](${base}/FanqieNovelDownloader-macos-arm64-unsigned.dmg) | [APP ZIP](${base}/FanqieNovelDownloader-macos-arm64-unsigned.zip)
+          - Intel： [DMG](${base}/FanqieNovelDownloader-macos-x64-unsigned.dmg) | [APP ZIP](${base}/FanqieNovelDownloader-macos-x64-unsigned.zip)
+          - [SHA-256 校验清单](${base}/SHA256SUMS-macos-unsigned.txt)
+
+          ### 安装
+
+          1. 优先打开 DMG，将应用拖入“应用程序”。
+          2. 本包只做了 ad-hoc 签名、未经 Apple 公证，首次启动会被拦截。前往“系统设置 → 隐私与安全性”，在被拦截的提示处选择“仍要打开”。
+          3. 若系统仍提示“已损坏”或没有出现“仍要打开”，在核对 SHA-256 后对该应用单独执行：
+
+          \`\`\`bash
+          xattr -dr com.apple.quarantine "/Applications/Fanqie Novel Downloader.app"
+          \`\`\`
+
+          不需要、也不应全局关闭 Gatekeeper。
+
+          ### 其他平台状态
+
+          本预发布只提供 macOS 客户端；其他平台请从[稳定版 Release](https://github.com/${GH_REPO}/releases/tag/${STABLE_TAG})获取：
+
+          - Windows 当前未配置 Authenticode 证书，SmartScreen 或“无法验证发行商”提示属于预期，核对 SHA-256 后可在文件属性中解除锁定。
+          - Linux 的 DEB / AppImage 不提供项目级发行商签名，请按架构选择并核对 SHA-256；AppImage 需要执行权限。
+          - Android 正式 APK / AAB 使用发布密钥并经 \`apksigner\` 验证；安装 APK 仍需允许未知来源。
+          - iOS IPA 当前为无 Apple 签名侧载包，不支持 App Store。
+          - 本预发布不进入稳定版自动更新；未签名或无 updater 签名的包请手动安装。
+          ### 构建信息
+
+          - 私有源码引用：\`${SOURCE_REF}\`
+          - 私有源码提交：\`${SOURCE_COMMIT}\`
+          - Bundle ID：\`com.pofl.fanqienoveldownloader\`
+          - 签名状态：ad-hoc 签名（无 Developer ID、未公证）
+          - 原生 macOS runner：DMG 挂载及 APP 启动 smoke test 通过
+          - 稳定版保持为：\`${STABLE_TAG}\`
+          EOF
+
+          python release-wrapper/scripts/release-assets.py upload \
+            --repo "${GH_REPO}" \
+            --release-id "${RELEASE_ID}" \
+            --tag "${TAG_NAME}" \
+            dist/*
+          gh release edit "${TAG_NAME}" \
+            --title "番茄小说下载器 macOS 未签名版 ${VERSION}" \
+            --notes-file release-notes.md \
+            --draft=false \
+            --prerelease
+
+          test "$(gh release view "${TAG_NAME}" --json isDraft --jq .isDraft)" = "false"
+          test "$(gh release view "${TAG_NAME}" --json isPrerelease --jq .isPrerelease)" = "true"
+          assets="$(gh release view "${TAG_NAME}" --json assets --jq '.assets[].name' | sort)"
+          expected="$(printf '%s\n' \
+            FanqieNovelDownloader-macos-arm64-unsigned.dmg \
+            FanqieNovelDownloader-macos-arm64-unsigned.zip \
+            FanqieNovelDownloader-macos-x64-unsigned.dmg \
+            FanqieNovelDownloader-macos-x64-unsigned.zip \
+            SHA256SUMS-macos-unsigned.txt | sort)"
+          diff -u <(printf '%s\n' "${expected}") <(printf '%s\n' "${assets}")
+          # sed 正则中的行尾锚点是字面量，不需要 shell 展开。
+          # shellcheck disable=SC2016
+          stable_source="$(gh api "repos/${GH_REPO}/releases/tags/stable" --jq '.body' | sed -n 's/^- 稳定源 Release：`\([^`]*\)`.*/\1/p' | head -n 1)"
+          test "${stable_source}" = "${STABLE_TAG}"
+
+      - name: Write publication summary
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag_name }}
+          SOURCE_COMMIT_FULL: ${{ needs.prepare.outputs.source_commit_full }}
+          STABLE_TAG_NAME: ${{ needs.macos-unsigned-bootstrap.outputs.stable_tag }}
+        run: |
+          cat >> "${GITHUB_STEP_SUMMARY}" <<EOF
+          ## Unsigned macOS prerelease published
+
+          - Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}
+          - Source commit: \`${SOURCE_COMMIT_FULL}\`
+          - Stable latest remains: \`${STABLE_TAG_NAME}\`
+          EOF

@@ -1,0 +1,89 @@
+name: 错误反馈
+description: 报告可以复现的软件故障、崩溃或异常行为
+title: "[Bug] "
+labels: ["错误反馈"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你花时间反馈问题。信息越完整，定位通常越快。请如实勾选下面的确认项并填写完整版本号。
+
+        请勿提交 token、签名、私钥、设备标识、Cookie 或其他个人数据。安全漏洞请使用私密报告入口。
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索现有 Issue，确认没有相同问题。
+          required: true
+        - label: 我已更新到 Releases 中的最新版本，并在最新版本上确认问题仍然存在。
+          required: true
+        - label: 我已删除日志、截图和链接中的敏感信息。
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: 应用版本
+      description: 请填写“设置 → 关于”或 Release 中显示的完整版本号；“最新版”这类说法无法定位问题。
+      placeholder: 例如 2026.10.25-1124
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 运行平台
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Android
+        - iOS
+        - 其他
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 系统版本与架构
+      description: 同时填写系统版本和 CPU 架构；移动端请补充设备型号。
+      placeholder: 例如 Windows 11 24H2 x64；Android 14 arm64-v8a
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题描述
+      description: 说明实际发生了什么、出现频率，以及问题从何时开始。
+      placeholder: 清楚描述实际结果，避免只写“不能用”或“报错”。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤
+      description: 请从启动应用开始，按顺序列出能稳定触发问题的最短步骤。
+      placeholder: |
+        1. 打开……
+        2. 输入……
+        3. 点击……
+        4. 出现……
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+      description: 说明正常情况下应该发生什么。
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 脱敏日志
+      description: 粘贴完整的报错文字，或在“设置 → 系统”导出的诊断日志；请先删掉账号、Cookie、token 等个人信息。没有可留空。
+      render: shell
+  - type: textarea
+    id: additional
+    attributes:
+      label: 截图或补充信息
+      description: 可粘贴截图，并补充保存目录类型、网络环境或其他有助于复现的信息。
